@@ -447,14 +447,54 @@ namespace ehal::http
         server.send(200, F("text/html"), page);
     }
 
+    // Track the upload result. Upstream ALWAYS answered HTTP 200 and rebooted,
+    // even if Update.begin/write/end had failed -> a failure was only visible from the version.
+    struct FirmwareUploadState
+    {
+        bool started = false;
+        String error;
+        size_t bytes = 0;
+    } fwUpload;
+
+    void fail_firmware_upload(const String& error)
+    {
+        if (fwUpload.error.isEmpty())
+            fwUpload.error = error;
+        if (Update.isRunning())
+            Update.abort();
+        log_web(F("Firmware update FAILED: %s"), fwUpload.error.c_str());
+    }
+
     void handle_firmware_update()
     {
         String page{F(PAGE_TEMPLATE)};
-        page.replace(F("{{PAGE_SCRIPT}}"), F("defer src='/reboot.js'"));
-        page.replace(F("{{PAGE_BODY}}"), F(BODY_TEMPLATE_FIRMWARE_UPDATE));
-
         server.sendHeader(F("Connection"), F("close"));
+
+        String error = fwUpload.error;
+        if (!fwUpload.started)
+            error = F("no firmware file received (form field 'update' missing?)");
+        else if (error.isEmpty() && !Update.isFinished())
+            error = F("upload incomplete");
+
+        if (!error.isEmpty())
+        {
+            // No restart: the running firmware stays active.
+            page.replace(F("{{PAGE_SCRIPT}}"), "");
+            page.replace(F("{{PAGE_BODY}}"), String(F("<h1>Firmware update FAILED</h1><p>")) + error +
+                         F("</p><p>The running firmware stays active, nothing was changed. <a href=\"/configuration\">Back</a></p>"));
+            server.send(500, F("text/html"), page);
+            fwUpload = FirmwareUploadState{};
+            return;
+        }
+
+        log_web(F("Firmware update OK (%u bytes), restarting into test mode..."), (unsigned)fwUpload.bytes);
+        page.replace(F("{{PAGE_SCRIPT}}"), F("defer src='/reboot.js'"));
+        page.replace(F("{{PAGE_BODY}}"), String(F("<p>Firmware update OK (")) + String((unsigned)fwUpload.bytes) +
+                     F(" bytes). Restarting - the new firmware runs in TEST MODE and confirms itself after ~3 min "
+                       "(see Diagnostics), otherwise the previous firmware is restored automatically. "
+                       "<span id=\"reboot_progress\"></span> <a href=\"/\">Home</a></p>"));
         server.send(200, F("text/html"), page);
+        fwUpload = FirmwareUploadState{};
 
         async_restart();
     }
@@ -466,9 +506,12 @@ namespace ehal::http
         {
         case UPLOAD_FILE_START:
         {
+            fwUpload = FirmwareUploadState{};
+            fwUpload.started = true;
+            log_web(F("Firmware upload started: %s"), upload.filename.c_str());
             if (!Update.begin(UPDATE_SIZE_UNKNOWN))
             {
-                log_web(F("Failed to start firmware update: %s"), Update.errorString());
+                fail_firmware_upload(String(F("Update.begin: ")) + Update.errorString());
             }
         }
         break;
@@ -476,25 +519,38 @@ namespace ehal::http
         case UPLOAD_FILE_WRITE:
         {
             ehal::ping_watchdog(); // the upload can take > 30 s (task watchdog)
+            if (!fwUpload.error.isEmpty())
+                break; // discard the rest of the upload
+
             if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
             {
-                log_web(F("Failed to write firmware chunk: %s"), Update.errorString());
+                fail_firmware_upload(String(F("Update.write at byte ")) + String((unsigned)fwUpload.bytes) + F(": ") + Update.errorString());
+                break;
             }
+            fwUpload.bytes += upload.currentSize;
         }
         break;
 
         case UPLOAD_FILE_END:
         {
-            if (!Update.end(true))
+            if (!fwUpload.error.isEmpty())
+                break;
+
+            if (fwUpload.bytes == 0)
             {
-                log_web(F("Failed to finalize firmware write: %s"), Update.errorString());
+                fail_firmware_upload(F("empty file"));
+            }
+            else if (!Update.end(true))
+            {
+                // end() verifies the image (header, hash, ...) and only then sets the boot partition.
+                fail_firmware_upload(String(F("Update.end (image check): ")) + Update.errorString());
             }
         }
         break;
 
         case UPLOAD_FILE_ABORTED:
         {
-            log_web(F("Firmware update process aborted!"));
+            fail_firmware_upload(F("upload aborted (connection lost)"));
         }
         break;
         }
