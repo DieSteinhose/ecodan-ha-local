@@ -314,6 +314,10 @@ namespace ehal
         <td>Compressor Running / Runtime:</td>
         <td>{{compressor_on}} / {{compressor_runtime}} h</td>
     </tr>
+    <tr>
+        <td>Compressor Starts / Avg. Run per Start:</td>
+        <td>{{compressor_starts}} / {{compressor_avg_run}} min <small>(outdoor request code 3, resolution 100 starts)</small></td>
+    </tr>
     <thead>
         <th colspan="2">Configuration &amp; Raw Data</th>
     </thead>

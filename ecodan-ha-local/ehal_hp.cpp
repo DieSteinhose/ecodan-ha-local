@@ -29,6 +29,49 @@ namespace ehal::hp
     RawResponse rawResponses[256];
     std::mutex rawResponseMutex;
 
+    // ---------------------------------------------------------------------------------
+    // Service request codes (GET 0xA3) - whitelist ONLY.
+    // Via 0xA3 the FTC queries request codes of the outdoor unit (OCH694A table 10-1, codes 0-149, there
+    // read-only codes). Whether the FTC also accepts ITS OWN codes this way (200 = factory reset,
+    // 340-363 = counter reset/forced operation!) is unknown -> no code outside this
+    // list may ever be sent. A 0xA3 message is only ever created in make_request_code_msg().
+    // ---------------------------------------------------------------------------------
+    const int16_t REQUEST_CODE_WHITELIST[] = {
+        3, // Compressor-Number of operation times, 0..9999, unit 100 starts
+    };
+    const auto REQUEST_CODE_INTERVAL = std::chrono::minutes(10);
+    const auto REQUEST_CODE_RETRY = std::chrono::milliseconds(1500);
+    const uint8_t REQUEST_CODE_MAX_TRIES = 10;
+
+    std::atomic<int16_t> rcActive{0}; // 0 = no query active (code 0 is never whitelisted); also read by the RX thread
+    uint8_t rcTries = 0;
+    std::chrono::steady_clock::time_point rcNextTry;
+    std::chrono::steady_clock::time_point rcLastCycle;
+    bool rcEverStarted = false;
+
+    bool is_request_code_whitelisted(int16_t code)
+    {
+        for (int16_t allowed : REQUEST_CODE_WHITELIST)
+            if (allowed == code)
+                return true;
+        return false;
+    }
+
+    // The only place that creates a 0xA3 message.
+    bool make_request_code_msg(int16_t code, Message& out)
+    {
+        if (!is_request_code_whitelisted(code))
+        {
+            log_web(F("BLOCKED: request code %d is not whitelisted"), (int)code);
+            return false;
+        }
+        Message msg{MsgType::GET_CMD, GetType::SERVICE_REQUEST_CODE};
+        msg[1] = static_cast<uint8_t>((code >> 8) & 0xFF); // code big-endian (like gekkekoe set_int16)
+        msg[2] = static_cast<uint8_t>(code & 0xFF);
+        out = msg;
+        return true;
+    }
+
     // DIP switches (GET 0x11)
     uint8_t dipSwitches[7] = {};
     std::atomic<bool> dipValid{false};
@@ -757,6 +800,25 @@ namespace ehal::hp
                 status.BoilerFlowTemperature = res.get_float16(1);
                 status.BoilerReturnTemperature = res.get_float16(4);
                 break;
+            case GetType::SERVICE_REQUEST_CODE:
+            {
+                const int16_t code = static_cast<int16_t>((uint16_t(res[1]) << 8) | res[2]);
+                const uint8_t state = res[3];
+                if (code != rcActive || !is_request_code_whitelisted(code))
+                    break; // no query or a different query active
+                if (state == 1 || state == 2)
+                {
+                    const uint16_t value = uint16_t(res[4]) | (uint16_t(res[5]) << 8); // Little-Endian
+                    if (code == 3)
+                    {
+                        status.CompressorStarts = uint32_t(value) * 100;
+                        status.CompressorStartsValid = true;
+                    }
+                    rcActive = 0;
+                }
+                // state 0: outdoor unit has not answered yet -> handle_loop retries
+                break;
+            }
             case GetType::ACTIVE_TIME:
                 status.CompressorOn = res[1] != 0;
                 // gekkekoe get_float24_v2(3): byte 3 = units/remainder, bytes 4..5 = hundreds
@@ -947,6 +1009,64 @@ namespace ehal::hp
         return true;
     }
 
+    // Periodic query of whitelisted request codes (currently code 3 only).
+    void handle_request_codes()
+    {
+        auto now = std::chrono::steady_clock::now();
+        Message msg;
+        bool send = false;
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+
+            if (rcActive == 0)
+            {
+                // First query 30 s after connecting, then every 10 min.
+                if (!rcEverStarted)
+                {
+                    rcEverStarted = true;
+                    rcLastCycle = now - REQUEST_CODE_INTERVAL + std::chrono::seconds(30);
+                }
+                if (now - rcLastCycle < REQUEST_CODE_INTERVAL)
+                    return;
+                rcLastCycle = now;
+                rcActive = REQUEST_CODE_WHITELIST[0];
+                rcTries = 0;
+                rcNextTry = now;
+            }
+
+            if (now < rcNextTry)
+                return;
+
+            if (rcTries >= REQUEST_CODE_MAX_TRIES)
+            {
+                // Lock is released below, log afterwards.
+                rcActive = 0;
+            }
+            else if (make_request_code_msg(rcActive, msg))
+            {
+                ++rcTries;
+                rcNextTry = now + REQUEST_CODE_RETRY;
+                PendingCmd pending;
+                pending.msg = msg;
+                getQueue.push_front(std::move(pending));
+                send = true;
+            }
+            else
+            {
+                rcActive = 0;
+            }
+        }
+
+        if (!send)
+        {
+            if (rcTries >= REQUEST_CODE_MAX_TRIES)
+                log_web(F("Request code query: no valid answer after %u tries (outdoor unit does not support it?)"), (unsigned)REQUEST_CODE_MAX_TRIES);
+            return;
+        }
+
+        dispatch_next_cmd();
+    }
+
     void handle_loop()
     {
         if (!is_connected() && !port.available())
@@ -967,6 +1087,7 @@ namespace ehal::hp
         else if (is_connected())
         {
             check_response_timeout();
+            handle_request_codes();
 
             auto now = std::chrono::steady_clock::now();
             bool refresh = false;

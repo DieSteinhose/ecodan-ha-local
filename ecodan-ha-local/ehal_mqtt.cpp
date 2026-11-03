@@ -60,6 +60,8 @@ namespace ehal::mqtt
         TEMPERATURE,
         FLOW_RATE,
         DURATION_HOURS,
+        DURATION_MINUTES,
+        COUNT,
         COP,
         CONNECTIVITY,
         WIFI_SIGNAL,
@@ -1055,6 +1057,18 @@ off
             payloadJson[F("dev_cla")] = F("temperature");
             break;
 
+        case SensorType::DURATION_MINUTES:
+            payloadJson[F("unit_of_meas")] = F("min");
+            payloadJson[F("icon")] = F("mdi:timer-sand");
+            payloadJson[F("stat_cla")] = F("measurement");
+            payloadJson[F("dev_cla")] = F("duration");
+            break;
+
+        case SensorType::COUNT:
+            payloadJson[F("icon")] = F("mdi:counter");
+            payloadJson[F("stat_cla")] = F("total_increasing");
+            break;
+
         case SensorType::DURATION_HOURS:
             payloadJson[F("unit_of_meas")] = F("h");
             payloadJson[F("icon")] = F("mdi:timer-outline");
@@ -1225,6 +1239,13 @@ off
             return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("compressor_runtime"), SensorType::DURATION_HOURS))
+            return false;
+
+        // Compressor starts (outdoor unit request code 3, resolution 100) + avg. runtime per start
+        if (!publish_ha_float_sensor_auto_discover(F("compressor_starts"), SensorType::COUNT))
+            return false;
+
+        if (!publish_ha_float_sensor_auto_discover(F("compressor_avg_run"), SensorType::DURATION_MINUTES))
             return false;
 
         if (!publish_ha_binary_sensor_auto_discover(F("mode_dhw_forced")))
@@ -1478,6 +1499,16 @@ off
                 return;
 
             if (!publish_sensor_status<float>(F("compressor_runtime"), status.CompressorRuntimeHours))
+                return;
+        }
+
+        if (status.CompressorStartsValid && status.CompressorStarts > 0)
+        {
+            if (!publish_sensor_status<float>(F("compressor_starts"), float(status.CompressorStarts)))
+                return;
+
+            if (status.CompressorRuntimeValid &&
+                !publish_sensor_status<float>(F("compressor_avg_run"), status.CompressorRuntimeHours * 60.0f / float(status.CompressorStarts)))
                 return;
         }
 

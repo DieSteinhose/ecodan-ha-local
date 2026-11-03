@@ -414,6 +414,11 @@ namespace ehal::http
             page.replace(F("{{buffer_temp}}"), status.BufferTemperatureValid ? String(status.BufferTemperature, 1) : String(F("?")));
             page.replace(F("{{compressor_on}}"), status.CompressorRuntimeValid ? bool_to_emoji(status.CompressorOn) : String(F("?")));
             page.replace(F("{{compressor_runtime}}"), status.CompressorRuntimeValid ? String(status.CompressorRuntimeHours, 0) : String(F("?")));
+            // Compressor starts
+            const bool startsOk = status.CompressorStartsValid && status.CompressorStarts > 0;
+            page.replace(F("{{compressor_starts}}"), startsOk ? String(status.CompressorStarts) : String(F("?")));
+            page.replace(F("{{compressor_avg_run}}"), (startsOk && status.CompressorRuntimeValid)
+                ? String(status.CompressorRuntimeHours * 60.0f / float(status.CompressorStarts), 1) : String(F("?")));
 
             page.replace(F("{{sh_consumed}}"), String(status.EnergyConsumedHeating));
             page.replace(F("{{sh_delivered}}"), String(status.EnergyDeliveredHeating));

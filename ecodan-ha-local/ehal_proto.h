@@ -60,6 +60,7 @@ namespace ehal::hp
         FLOW_RATE = 0x14,
         MODE_FLAGS_A = 0x26,
         MODE_FLAGS_B = 0x28,
+        SERVICE_REQUEST_CODE = 0xA3,  // read an OUTDOOR UNIT request code (whitelist only, see ehal_hp.cpp)
         ENERGY_USAGE = 0xA1,
         ENERGY_DELIVERY = 0xA2
     };

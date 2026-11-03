@@ -38,6 +38,9 @@ namespace ehal::hp
         bool CompressorOn = false;
         float CompressorRuntimeHours = 0.0f;
         bool CompressorRuntimeValid = false;
+        // Outdoor unit request code 3 "Compressor-Number of operation times" (OCH694A: unit 100 starts)
+        uint32_t CompressorStarts = 0;
+        bool CompressorStartsValid = false;
         float DhwFlowTemperatureSetPoint;
         float RadiatorFlowTemperatureSetPoint;
 
