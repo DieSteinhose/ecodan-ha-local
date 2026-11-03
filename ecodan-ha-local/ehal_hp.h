@@ -268,5 +268,6 @@ namespace ehal::hp
     bool is_connected();
 
     uint64_t get_rx_msg_count();
+    uint32_t get_status_cycle_count(); // fully received status cycles since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp

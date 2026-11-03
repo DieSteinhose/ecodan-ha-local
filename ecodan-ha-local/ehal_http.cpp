@@ -1,5 +1,6 @@
 #include "ehal_config.h"
 #include "ehal_css_gz.h"
+#include "ehal_ota.h"
 #include "ehal_diagnostics.h"
 #include "ehal_hp.h"
 #include "ehal_html.h"
@@ -332,7 +333,7 @@ namespace ehal::http
         char deviceMac[19] = {};
         snprintf_P(deviceMac, sizeof(deviceMac), (PGM_P)F("%#llx"), ESP.getEfuseMac());
 
-        page.replace(F("{{sw_ver}}"), get_software_version());
+        page.replace(F("{{sw_ver}}"), get_software_version() + F(" [") + ota::state_description() + F("]"));
         page.replace(F("{{device_mac}}"), deviceMac);
         page.replace(F("{{device_cpus}}"), String(ESP.getChipCores()));
         page.replace(F("{{device_cpu_freq}}"), String(ESP.getCpuFreqMHz()));
@@ -454,6 +455,7 @@ namespace ehal::http
 
         case UPLOAD_FILE_WRITE:
         {
+            ehal::ping_watchdog(); // the upload can take > 30 s (task watchdog)
             if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
             {
                 log_web(F("Failed to write firmware chunk: %s"), Update.errorString());
@@ -524,6 +526,25 @@ namespace ehal::http
         handle_redirect();
     }
 
+    // Manual switch back to the firmware in the other OTA partition (login required).
+    void handle_firmware_rollback()
+    {
+        if (show_login_if_required())
+            return;
+
+        String error;
+        if (!ota::rollback_to_previous(error))
+        {
+            log_web(F("Manual firmware rollback refused: %s"), error.c_str());
+            server.send(409, F("text/plain"), String(F("Rollback not possible: ")) + error);
+            return;
+        }
+
+        server.sendHeader(F("Connection"), F("close"));
+        server.send(200, F("text/plain"), F("Switching to previous firmware, restarting..."));
+        async_restart();
+    }
+
     void handle_milligram_css()
     {
         // gzip-compressed from flash (10 KB -> 2.4 KB), no heap copy; browsers may cache it for 1 day.
@@ -544,6 +565,7 @@ namespace ehal::http
         server.on(F("/save"), handle_save_configuration);
         server.on(F("/clear_config"), handle_clear_config);
         server.on(F("/update"), HTTP_POST, handle_firmware_update, handle_firmware_update_handler);
+        server.on(F("/firmware_rollback"), HTTP_POST, handle_firmware_rollback);
 
         // XMLHTTPRequest / Javascript / CSS
         server.on(F("/query_ssid"), handle_query_ssid_list);

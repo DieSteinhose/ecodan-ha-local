@@ -18,6 +18,7 @@ namespace ehal::hp
     HardwareSerial port = Serial1;
     uint64_t rxMsgCount = 0;
     uint64_t txMsgCount = 0;
+    std::atomic<uint32_t> statusCycleCount{0};
 
     TaskHandle_t serialRxTaskHandle = nullptr;
     std::thread serialRxThread;
@@ -757,6 +758,7 @@ namespace ehal::hp
                 status.EnergyDeliveredHeating = res.get_float24(4);
                 status.EnergyDeliveredCooling = res.get_float24(7);
                 status.EnergyDeliveredDhw = res.get_float24(10);
+                ++statusCycleCount; // last type in the cycle
                 {
                     // Log the RX thread's stack headroom once per boot.
                     static bool stackLogged = false;
@@ -960,5 +962,10 @@ namespace ehal::hp
     uint64_t get_rx_msg_count()
     {
         return rxMsgCount;
+    }
+
+    uint32_t get_status_cycle_count()
+    {
+        return statusCycleCount;
     }
 } // namespace ehal::hp

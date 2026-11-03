@@ -13,6 +13,7 @@
 #include "ehal_hp.h"
 #include "ehal_http.h"
 #include "ehal_mqtt.h"
+#include "ehal_ota.h"
 #include "ehal_thirdparty.h"
 
 bool mqttInitialized = false;
@@ -246,6 +247,7 @@ void setup()
     pinMode(ehal::config_instance().StatusLed, OUTPUT);
 
     log_last_reset_reason();
+    ehal::ota::initialize();
     ehal::log_web(F("Ecodan HomeAssistant Bridge startup successful, starting request processing."));
 
     ehal::init_watchdog();
@@ -270,6 +272,8 @@ void loop()
         update_status_led();
 
         reboot_if_wifi_disconnected_too_long();
+
+        ehal::ota::handle_loop();
     }
     catch (std::exception const& ex)
     {
