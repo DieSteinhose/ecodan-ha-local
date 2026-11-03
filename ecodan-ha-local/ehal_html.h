@@ -284,6 +284,44 @@ namespace ehal
         <td>{{outside_temp}}&#176;C</td>
     </tr>
     <thead>
+        <th colspan="2">Hydraulics</th>
+    </thead>
+    <tr>
+        <td>Heat Pump Flow / Return:</td>
+        <td>{{hp_feed_temp}} / {{hp_return_temp}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>Heating Circuit Flow / Return:</td>
+        <td>{{boiler_flow_temp}} / {{boiler_return_temp}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>Flow Target Z1 / Current:</td>
+        <td>{{z1_flow_target}} / {{sh_flow_target}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>Flow Rate:</td>
+        <td>{{flow_rate}} l/min</td>
+    </tr>
+    <tr>
+        <td>Compressor:</td>
+        <td>{{compressor_freq}} Hz</td>
+    </tr>
+    <thead>
+        <th colspan="2">Auxiliary Thermistors (GET 0x0E, THW10 candidates)</th>
+    </thead>
+    <tr>
+        <td>aux_temp_1 / 2 / 3:</td>
+        <td>{{aux1}} / {{aux2}} / {{aux3}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>aux_temp_4 / 5:</td>
+        <td>{{aux4}} / {{aux5}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>Raw payload:</td>
+        <td><code>{{thermistor_raw}}</code></td>
+    </tr>
+    <thead>
         <th colspan="2">Efficiency (Last 24h)</th>
     </thead>
     <tr>

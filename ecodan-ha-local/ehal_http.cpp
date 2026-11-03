@@ -388,6 +388,26 @@ namespace ehal::http
             page.replace(F("{{dhw_set_temp}}"), String(status.DhwFlowTemperatureSetPoint, 1));
             page.replace(F("{{outside_temp}}"), String(status.OutsideTemperature, 1));
 
+            // Hydraulics + THW10 candidates (GET 0x0E) in the web UI as well
+            page.replace(F("{{hp_feed_temp}}"), String(status.DhwFeedTemperature, 1));
+            page.replace(F("{{hp_return_temp}}"), String(status.DhwReturnTemperature, 1));
+            page.replace(F("{{boiler_flow_temp}}"), String(status.BoilerFlowTemperature, 1));
+            page.replace(F("{{boiler_return_temp}}"), String(status.BoilerReturnTemperature, 1));
+            page.replace(F("{{z1_flow_target}}"), String(status.Zone1FlowTemperatureSetPoint, 1));
+            page.replace(F("{{sh_flow_target}}"), String(status.RadiatorFlowTemperatureSetPoint, 1));
+            page.replace(F("{{flow_rate}}"), String(status.FlowRate));
+            page.replace(F("{{compressor_freq}}"), String(status.CompressorFrequency));
+            {
+                const char* auxKeys[] = {"{{aux1}}", "{{aux2}}", "{{aux3}}", "{{aux4}}", "{{aux5}}"};
+                for (size_t i = 0; i < 5; ++i)
+                    page.replace(auxKeys[i], String(status.AuxiliaryTemps[i], 2));
+
+                char raw[16 * 3];
+                for (size_t i = 0; i < 16; ++i)
+                    snprintf(raw + i * 3, 4, i < 15 ? "%02X " : "%02X", status.ThermistorRaw[i]);
+                page.replace(F("{{thermistor_raw}}"), raw);
+            }
+
             page.replace(F("{{sh_consumed}}"), String(status.EnergyConsumedHeating));
             page.replace(F("{{sh_delivered}}"), String(status.EnergyDeliveredHeating));
             if (status.EnergyConsumedHeating > 0.0f)

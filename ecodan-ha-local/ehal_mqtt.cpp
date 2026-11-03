@@ -31,7 +31,7 @@ namespace ehal::mqtt
 
     // Delta publishing. For each state topic a hash of the last sent payload
     // is stored; unchanged values are not resent. Full refresh every
-    // 4 min (< exp_aft 300 s!), after (re)connect and when Home Assistant restarts (homeassistant/status).
+    // 2 min (< exp_aft 300 s!), after (re)connect and when Home Assistant restarts (homeassistant/status).
     struct PublishedState
     {
         uint32_t topicHash;
@@ -43,8 +43,9 @@ namespace ehal::mqtt
     std::chrono::steady_clock::time_point statePublishHoldoff = std::chrono::steady_clock::now();
     // MUST be shorter than SENSOR_STATE_TIMEOUT (exp_aft = 300 s), otherwise HA sets unchanged
     // values to "unavailable" (with 10 min, sensors were unavailable 5 out of 10 min).
-    const auto FULL_STATE_REFRESH_INTERVAL = std::chrono::seconds(240);
-    static_assert(240 + 10 < SENSOR_STATE_TIMEOUT, "full refresh (+tick) must happen before exp_aft");
+    // All values every 2 min (robust against briefly lost messages / connection drops).
+    const auto FULL_STATE_REFRESH_INTERVAL = std::chrono::seconds(120);
+    static_assert(120 + 10 < SENSOR_STATE_TIMEOUT, "full refresh (+tick) must happen before exp_aft");
     const auto STATE_PUBLISH_INTERVAL = std::chrono::seconds(10);
     const auto MQTT_RECONNECT_INTERVAL = std::chrono::seconds(30);
     const auto DISCOVERY_SETTLE_TIME = std::chrono::seconds(5); // HA needs a moment to create the entities
