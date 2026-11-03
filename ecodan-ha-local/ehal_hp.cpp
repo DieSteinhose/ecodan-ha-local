@@ -6,6 +6,7 @@
 
 #include <HardwareSerial.h>
 #include <freertos/task.h>
+#include <esp_pthread.h>
 
 #include <atomic>
 #include <deque>
@@ -756,6 +757,15 @@ namespace ehal::hp
                 status.EnergyDeliveredHeating = res.get_float24(4);
                 status.EnergyDeliveredCooling = res.get_float24(7);
                 status.EnergyDeliveredDhw = res.get_float24(10);
+                {
+                    // Log the RX thread's stack headroom once per boot.
+                    static bool stackLogged = false;
+                    if (!stackLogged)
+                    {
+                        stackLogged = true;
+                        log_web(F("RX thread stack: %u bytes never used (of 6144)"), (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+                    }
+                }
                 break;
             default:
                 log_web(F("Unknown response type received on serial port: %u"), static_cast<uint8_t>(res.payload_type<GetType>()));
@@ -871,6 +881,16 @@ namespace ehal::hp
 
         port.begin(2400, SERIAL_8E1, config.SerialRxPort, config.SerialTxPort);
 
+        // std::thread only gets a 2048 B stack in the current Arduino core (IDF 5.5)
+        // (CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT). With packet dump enabled (log_web -> vsnprintf/strftime)
+        // the RX thread overflowed its stack -> panic/boot loop (confirmed by core dump). Hence 6 KB.
+        {
+            esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+            cfg.stack_size = 6144;
+            cfg.prio = 5;
+            cfg.thread_name = "ecodan_rx";
+            esp_pthread_set_cfg(&cfg);
+        }
         serialRxThread = std::thread{serial_rx_thread};
 
         if (!begin_connect())
