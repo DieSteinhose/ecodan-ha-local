@@ -53,6 +53,7 @@ namespace ehal::hp
         SH_TEMPERATURE_STATE = 0x0B,
         DHW_TEMPERATURE_STATE_A = 0x0C,
         DHW_TEMPERATURE_STATE_B = 0x0D,
+        THERMISTOR_STATE = 0x0E,
         ACTIVE_TIME = 0x13,
         FLOW_RATE = 0x14,
         MODE_FLAGS_A = 0x26,

@@ -31,6 +31,9 @@ namespace ehal::hp
         float BoilerFlowTemperature;
         float BoilerReturnTemperature;
         uint8_t FlowRate;
+        // GET 0x0E ("several unknown temperatures"): raw bytes + 5 decoding candidates (BE16 x100 at payload 1,4,7,10,13)
+        float AuxiliaryTemps[5];
+        uint8_t ThermistorRaw[16];
         float DhwFlowTemperatureSetPoint;
         float RadiatorFlowTemperatureSetPoint;
 

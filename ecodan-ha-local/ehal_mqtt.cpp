@@ -1040,6 +1040,24 @@ off
         if (!publish_ha_float_sensor_auto_discover(F("flow_rate"), SensorType::FLOW_RATE))
             return;
 
+        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_1"), SensorType::TEMPERATURE))
+            return;
+
+        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_2"), SensorType::TEMPERATURE))
+            return;
+
+        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_3"), SensorType::TEMPERATURE))
+            return;
+
+        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_4"), SensorType::TEMPERATURE))
+            return;
+
+        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_5"), SensorType::TEMPERATURE))
+            return;
+
+        if (!publish_ha_string_sensor_auto_discover(F("thermistor_raw")))
+            return;
+
         if (!publish_ha_binary_sensor_auto_discover(F("mode_dhw_forced")))
             return;
 
@@ -1253,6 +1271,20 @@ off
 
         if (!publish_sensor_status<float>(F("flow_rate"), status.FlowRate))
             return;
+
+        {
+            char raw[33];
+            for (size_t i = 0; i < 16; ++i)
+                sprintf(raw + i * 2, "%02X", status.ThermistorRaw[i]);
+            if (!publish_sensor_status<String>(F("thermistor_raw"), String(raw)))
+                return;
+        }
+
+        for (size_t i = 0; i < 5; ++i)
+        {
+            if (!publish_sensor_status<float>(String(F("aux_temp_")) + String(i + 1), status.AuxiliaryTemps[i]))
+                return;
+        }
 
         if (!publish_binary_sensor_status(F("mode_dhw_forced"), status.DhwForcedActive))
             return;

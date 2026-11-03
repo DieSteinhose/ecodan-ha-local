@@ -225,6 +225,7 @@ namespace ehal::hp
             cmdQueue.emplace(MsgType::GET_CMD, GetType::DHW_TEMPERATURE_STATE_B);
             // cmdQueue.emplace(MsgType::GET_CMD, GetType::ACTIVE_TIME);
             cmdQueue.emplace(MsgType::GET_CMD, GetType::FLOW_RATE);
+            cmdQueue.emplace(MsgType::GET_CMD, GetType::THERMISTOR_STATE);
             cmdQueue.emplace(MsgType::GET_CMD, GetType::MODE_FLAGS_A);
             cmdQueue.emplace(MsgType::GET_CMD, GetType::MODE_FLAGS_B);
             cmdQueue.emplace(MsgType::GET_CMD, GetType::ENERGY_USAGE);
@@ -600,6 +601,11 @@ namespace ehal::hp
                 break;
             case GetType::FLOW_RATE:
                 status.FlowRate = res[12];
+                break;
+            case GetType::THERMISTOR_STATE:
+                memcpy(status.ThermistorRaw, res.payload(), PAYLOAD_SIZE);
+                for (size_t i = 0; i < 5; ++i)
+                    status.AuxiliaryTemps[i] = res.get_float16(1 + i * 3);
                 break;
             case GetType::MODE_FLAGS_A:
                 status.set_power_mode(res[3]);
