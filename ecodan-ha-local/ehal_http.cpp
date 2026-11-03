@@ -367,6 +367,19 @@ namespace ehal::http
         server.send(200, F("text/javascript"), js);
     }
 
+    // Raw response of a GET type as hex string ("?" if never received)
+    String raw_response_hex(uint8_t type)
+    {
+        uint8_t buf[16];
+        uint32_t age = 0;
+        if (!hp::get_last_response(type, buf, age))
+            return F("?");
+        char raw[16 * 3];
+        for (size_t i = 0; i < 16; ++i)
+            snprintf(raw + i * 3, 4, i < 15 ? "%02X " : "%02X", buf[i]);
+        return String(raw);
+    }
+
     void handle_heat_pump()
     {
         if (show_login_if_required())
@@ -397,16 +410,10 @@ namespace ehal::http
             page.replace(F("{{sh_flow_target}}"), String(status.RadiatorFlowTemperatureSetPoint, 1));
             page.replace(F("{{flow_rate}}"), String(status.FlowRate));
             page.replace(F("{{compressor_freq}}"), String(status.CompressorFrequency));
-            {
-                const char* auxKeys[] = {"{{aux1}}", "{{aux2}}", "{{aux3}}", "{{aux4}}", "{{aux5}}"};
-                for (size_t i = 0; i < 5; ++i)
-                    page.replace(auxKeys[i], String(status.AuxiliaryTemps[i], 2));
-
-                char raw[16 * 3];
-                for (size_t i = 0; i < 16; ++i)
-                    snprintf(raw + i * 3, 4, i < 15 ? "%02X " : "%02X", status.ThermistorRaw[i]);
-                page.replace(F("{{thermistor_raw}}"), raw);
-            }
+            // THW10, compressor
+            page.replace(F("{{buffer_temp}}"), status.BufferTemperatureValid ? String(status.BufferTemperature, 1) : String(F("?")));
+            page.replace(F("{{compressor_on}}"), status.CompressorRuntimeValid ? bool_to_emoji(status.CompressorOn) : String(F("?")));
+            page.replace(F("{{compressor_runtime}}"), status.CompressorRuntimeValid ? String(status.CompressorRuntimeHours, 0) : String(F("?")));
 
             page.replace(F("{{sh_consumed}}"), String(status.EnergyConsumedHeating));
             page.replace(F("{{sh_delivered}}"), String(status.EnergyDeliveredHeating));
@@ -442,6 +449,16 @@ namespace ehal::http
 
             page.replace(F("{{min_flow_temp}}"), String(status.MinimumFlowTemperature));
             page.replace(F("{{max_flow_temp}}"), String(status.MaximumFlowTemperature));
+        }
+
+        // Configuration & raw data (outside the status lock)
+        {
+            int8_t z2 = hp::zone2_present();
+            page.replace(F("{{zone2}}"), z2 < 0 ? String(F("unknown (DIP switches not read yet)")) : (z2 ? String(F("present")) : String(F("not present - zone 2 entities disabled"))));
+            page.replace(F("{{dip_switches}}"), hp::dip_switches_as_string());
+            page.replace(F("{{raw_0f}}"), String(F("0F: ")) + raw_response_hex(0x0F));
+            page.replace(F("{{raw_13}}"), String(F("13: ")) + raw_response_hex(0x13));
+            page.replace(F("{{raw_0e}}"), String(F("0E: ")) + raw_response_hex(0x0E));
         }
 
         server.send(200, F("text/html"), page);
@@ -621,6 +638,66 @@ namespace ehal::http
         async_restart();
     }
 
+    // Diagnostics. GET /cn105_probe            -> all raw responses received so far
+    //               GET /cn105_probe?type=0x13  -> send one GET (whitelist only, read-only), wait up to 3 s
+    void handle_cn105_probe()
+    {
+        if (show_login_if_required())
+            return;
+
+        String out;
+        if (server.hasArg(F("type")))
+        {
+            uint8_t type = static_cast<uint8_t>(strtoul(server.arg(F("type")).c_str(), nullptr, 0));
+            if (!hp::is_probe_type_allowed(type))
+            {
+                server.send(400, F("text/plain"), F("type not allowed (only read-only GET types 0x01..0x2F, 0xA1, 0xA2)"));
+                return;
+            }
+
+            const uint32_t requestedAt = millis();
+            if (!hp::request_probe(type))
+            {
+                server.send(503, F("text/plain"), F("heat pump not connected"));
+                return;
+            }
+
+            // Wait for a response received AFTER sending (max. 3 s).
+            bool got = false;
+            while (!got && millis() - requestedAt < 3000)
+            {
+                delay(20);
+                ehal::ping_watchdog();
+                uint8_t buf[16];
+                uint32_t age = 0;
+                if (hp::get_last_response(type, buf, age) && age <= millis() - requestedAt)
+                    got = true;
+            }
+
+            char hdr[48];
+            snprintf(hdr, sizeof(hdr), "GET 0x%02X: ", type);
+            out += hdr;
+            out += got ? raw_response_hex(type) : String(F("no response within 3 s"));
+            out += F("\n\n");
+        }
+
+        out += F("Last raw responses (payload bytes 0..15, byte 0 = type):\n");
+        for (int t = 0; t < 256; ++t)
+        {
+            uint8_t buf[16];
+            uint32_t age = 0;
+            if (!hp::get_last_response(static_cast<uint8_t>(t), buf, age))
+                continue;
+            char line[96];
+            snprintf(line, sizeof(line), "0x%02X (%lus ago): ", t, (unsigned long)(age / 1000));
+            out += line;
+            out += raw_response_hex(static_cast<uint8_t>(t));
+            out += '\n';
+        }
+
+        server.send(200, F("text/plain"), out);
+    }
+
     void handle_milligram_css()
     {
         // gzip-compressed from flash (10 KB -> 2.4 KB), no heap copy; browsers may cache it for 1 day.
@@ -642,6 +719,7 @@ namespace ehal::http
         server.on(F("/clear_config"), handle_clear_config);
         server.on(F("/update"), HTTP_POST, handle_firmware_update, handle_firmware_update_handler);
         server.on(F("/firmware_rollback"), HTTP_POST, handle_firmware_rollback);
+        server.on(F("/cn105_probe"), HTTP_GET, handle_cn105_probe);
 
         // XMLHTTPRequest / Javascript / CSS
         server.on(F("/query_ssid"), handle_query_ssid_list);

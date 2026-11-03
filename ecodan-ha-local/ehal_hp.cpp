@@ -20,6 +20,19 @@ namespace ehal::hp
     uint64_t txMsgCount = 0;
     std::atomic<uint32_t> statusCycleCount{0};
 
+    // Last raw response per GET type (for /cn105_probe and web UI)
+    struct RawResponse
+    {
+        uint8_t data[PAYLOAD_SIZE];
+        uint32_t when = 0; // millis(), 0 = never received
+    };
+    RawResponse rawResponses[256];
+    std::mutex rawResponseMutex;
+
+    // DIP switches (GET 0x11)
+    uint8_t dipSwitches[7] = {};
+    std::atomic<bool> dipValid{false};
+
     TaskHandle_t serialRxTaskHandle = nullptr;
     std::thread serialRxThread;
 
@@ -375,12 +388,20 @@ namespace ehal::hp
                 GetType::DHW_TEMPERATURE_STATE_B,
                 // GetType::ACTIVE_TIME,
                 GetType::FLOW_RATE,
-                GetType::THERMISTOR_STATE,
+                GetType::TEMPERATURE_STATE_D, // THW10 (instead of 0x0E)
+                GetType::ACTIVE_TIME,         // compressor on / runtime
                 GetType::MODE_FLAGS_A,
                 GetType::MODE_FLAGS_B,
                 GetType::ENERGY_USAGE,
                 GetType::ENERGY_DELIVERY,
             };
+
+            if (!dipValid)
+            {
+                PendingCmd dip;
+                dip.msg = Message{MsgType::GET_CMD, GetType::DIP_SWITCHES};
+                getQueue.push_back(std::move(dip));
+            }
 
             for (auto t : types)
             {
@@ -684,6 +705,15 @@ namespace ehal::hp
     void handle_get_response(Message& res)
     {
         {
+            // Store the raw response for diagnostics
+            std::lock_guard<std::mutex> lock{rawResponseMutex};
+            RawResponse& r = rawResponses[res.payload_type<uint8_t>()];
+            memcpy(r.data, res.payload(), PAYLOAD_SIZE);
+            uint32_t now = millis();
+            r.when = now == 0 ? 1 : now;
+        }
+
+        {
             std::lock_guard<Status> lock{status};
 
             switch (res.payload_type<GetType>())
@@ -728,14 +758,28 @@ namespace ehal::hp
                 status.BoilerReturnTemperature = res.get_float16(4);
                 break;
             case GetType::ACTIVE_TIME:
+                status.CompressorOn = res[1] != 0;
+                // gekkekoe get_float24_v2(3): byte 3 = units/remainder, bytes 4..5 = hundreds
+                status.CompressorRuntimeHours = float((uint16_t(res[4]) << 8) | res[5]) * 100.0f + res[3];
+                status.CompressorRuntimeValid = true;
                 break;
             case GetType::FLOW_RATE:
                 status.FlowRate = res[12];
                 break;
             case GetType::THERMISTOR_STATE:
-                memcpy(status.ThermistorRaw, res.payload(), PAYLOAD_SIZE);
-                for (size_t i = 0; i < 5; ++i)
-                    status.AuxiliaryTemps[i] = res.get_float16(1 + i * 3);
+                break; // boiler flow/return, usually unused (still available via probe)
+            case GetType::TEMPERATURE_STATE_D:
+                status.BufferTemperature = res.get_float16(1);
+                status.BufferTemperatureValid = true;
+                break;
+            case GetType::DIP_SWITCHES:
+                for (size_t i = 0; i < 7; ++i)
+                    dipSwitches[i] = res[1 + i * 2];
+                if (!dipValid)
+                {
+                    dipValid = true;
+                    log_web(F("DIP switches read: %s -> zone 2 %s"), dip_switches_as_string().c_str(), zone2_present() == 1 ? "present" : "not present");
+                }
                 break;
             case GetType::MODE_FLAGS_A:
                 status.set_power_mode(res[3]);
@@ -967,5 +1011,75 @@ namespace ehal::hp
     uint32_t get_status_cycle_count()
     {
         return statusCycleCount;
+    }
+
+    int8_t zone2_present()
+    {
+        if (!dipValid)
+            return -1;
+
+        // Logic from gekkekoe (status.h has_2zones), bit 0 = switch x-1:
+        //  SW3-6 on and SW2-7 off -> 2 zones with shared flow (2-zone valve)
+        //  SW2-6 on and SW2-7 on  -> 2 zones with separate flow circuits (mixing tank)
+        auto isOn = [](uint8_t v, uint8_t n) { return (v & (1U << n)) != 0; };
+        const uint8_t sw2 = dipSwitches[1];
+        const uint8_t sw3 = dipSwitches[2];
+        if (isOn(sw3, 5) && !isOn(sw2, 6))
+            return 1;
+        if (isOn(sw2, 5) && isOn(sw2, 6))
+            return 1;
+        return 0;
+    }
+
+    String dip_switches_as_string()
+    {
+        if (!dipValid)
+            return F("unknown");
+
+        String s;
+        for (size_t i = 0; i < 7; ++i)
+        {
+            s += F("SW");
+            s += String(i + 1);
+            s += ' ';
+            for (uint8_t b = 0; b < 8; ++b)
+                s += (dipSwitches[i] & (1U << b)) ? '1' : '0';
+            if (i < 6)
+                s += ' ';
+        }
+        return s;
+    }
+
+    bool is_probe_type_allowed(uint8_t type)
+    {
+        // Only GET types without parameters. Excluded: 0xA3 (service request code - also includes
+        // reset/forced operation codes!) and 0xC9 (different message type).
+        return (type >= 0x01 && type <= 0x2F) || type == 0xA1 || type == 0xA2;
+    }
+
+    bool request_probe(uint8_t type)
+    {
+        if (!is_probe_type_allowed(type) || !connected)
+            return false;
+
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+            PendingCmd pending;
+            pending.msg = Message{MsgType::GET_CMD, static_cast<GetType>(type)};
+            getQueue.push_front(std::move(pending));
+        }
+
+        return dispatch_next_cmd();
+    }
+
+    bool get_last_response(uint8_t type, uint8_t out[16], uint32_t& ageMs)
+    {
+        std::lock_guard<std::mutex> lock{rawResponseMutex};
+        const RawResponse& r = rawResponses[type];
+        if (r.when == 0)
+            return false;
+        memcpy(out, r.data, PAYLOAD_SIZE);
+        ageMs = millis() - r.when;
+        return true;
     }
 } // namespace ehal::hp

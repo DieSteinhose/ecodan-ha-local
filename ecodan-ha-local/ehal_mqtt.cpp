@@ -59,6 +59,7 @@ namespace ehal::mqtt
         FREQUENCY,
         TEMPERATURE,
         FLOW_RATE,
+        DURATION_HOURS,
         COP,
         CONNECTIVITY,
         WIFI_SIGNAL,
@@ -455,6 +456,10 @@ off
             {
                 on_z1_flow_target_temperature_set_command(payload);
             }
+            else if ((z2TempCmdTopic == topic || z2FlowTargetCmdTopic == topic) && hp::zone2_present() == 0)
+            {
+                log_web(F("Ignoring zone 2 command, no zone 2 configured (DIP switches)"));
+            }
             else if (z2TempCmdTopic == topic)
             {
                 on_z2_temperature_set_command(payload);
@@ -662,6 +667,14 @@ off
         String output;
         serializeJson(json, output);
         return publish_state(topic, output);
+    }
+
+    // Remove an entity from HA (empty retained discovery message). Errors are not critical.
+    void remove_ha_entity(const String& component, const String& name)
+    {
+        String topic = String(F("homeassistant/")) + component + "/" + unique_entity_name(name) + F("/config");
+        mqttClient.publish(topic, String(), /* retain =*/true, static_cast<int>(LWMQTT_QOS1));
+        ehal::ping_watchdog();
     }
 
     bool publish_ha_climate_auto_discover()
@@ -898,7 +911,9 @@ off
         payloadJson[F("temp_stat_t")] = config.MqttTopic + "/" + unique_entity_name(F("dhw_flow_temp_target")) + F("/state");
         payloadJson[F("mode_stat_t")] = config.MqttTopic + "/" + unique_entity_name(F("mode_dhw")) + F("/state");
         payloadJson[F("mode_stat_tpl")] = "{% if value==\"Eco\" %} eco {% elif value==\"Normal\" %} performance {% else %} off {% endif %}";
-        payloadJson[F("power_cmd_t")] = config.MqttTopic + "/" + unique_entity_name(F("mode_dhw_forced")) + F("/state");
+        // (fork VonLatvala 73d5a0f): must be a topic the firmware subscribes to. Previously pointed to the
+        // STATE topic of mode_dhw_forced -> on/off on the water_heater only corrupted the DHW boost state.
+        payloadJson[F("power_cmd_t")] = config.MqttTopic + "/" + unique_entity_name(F("force_dhw")) + F("/set");
         payloadJson[F("mode_cmd_t")] = config.MqttTopic + "/" + unique_entity_name(F("dhw_mode")) + F("/set");
         payloadJson[F("min_temp")] = String(ehal::hp::get_min_dhw_temperature());
         payloadJson[F("max_temp")] = String(ehal::hp::get_max_dhw_temperature());
@@ -1003,34 +1018,48 @@ off
 
         switch (type)
         {
+        // device/state classes from fork VonLatvala 73d5a0f (+ output_pwr fix from HA log).
         case SensorType::POWER:
             payloadJson[F("unit_of_meas")] = F("kWh");
             payloadJson[F("icon")] = F("mdi:lightning-bolt");
-            payloadJson[F("stat_cla")] = F("total");
+            // Daily values (0xA1/0xA2 contain a date) are reset every day -> total_increasing,
+            // otherwise HA would count the reset as negative energy.
+            payloadJson[F("stat_cla")] = F("total_increasing");
             payloadJson[F("dev_cla")] = F("energy");
             break;
 
         case SensorType::LIVE_POWER:
             payloadJson[F("unit_of_meas")] = F("kW");
             payloadJson[F("icon")] = F("mdi:lightning-bolt");
-            payloadJson[F("dev_cla")] = F("energy");
+            payloadJson[F("stat_cla")] = F("measurement");
+            payloadJson[F("dev_cla")] = F("power"); // was "energy" -> HA rejected the sensor (unavailable)
             break;
 
         case SensorType::FREQUENCY:
             payloadJson[F("unit_of_meas")] = F("Hz");
             payloadJson[F("icon")] = F("mdi:fan");
+            payloadJson[F("stat_cla")] = F("measurement");
             payloadJson[F("dev_cla")] = F("frequency");
             break;
 
         case SensorType::FLOW_RATE:
             payloadJson[F("unit_of_meas")] = F("L/min");
             payloadJson[F("icon")] = F("mdi:pump");
+            payloadJson[F("stat_cla")] = F("measurement");
             // payloadJson[F("dev_cla")] = F("water");
             break;
 
         case SensorType::TEMPERATURE:
             payloadJson[F("unit_of_meas")] = F("°C");
+            payloadJson[F("stat_cla")] = F("measurement");
             payloadJson[F("dev_cla")] = F("temperature");
+            break;
+
+        case SensorType::DURATION_HOURS:
+            payloadJson[F("unit_of_meas")] = F("h");
+            payloadJson[F("icon")] = F("mdi:timer-outline");
+            payloadJson[F("stat_cla")] = F("total_increasing");
+            payloadJson[F("dev_cla")] = F("duration");
             break;
 
         case SensorType::COP:
@@ -1149,8 +1178,15 @@ off
         if (!publish_ha_climate_auto_discover())
             return false;
 
-        if (!publish_ha_climate_z2_auto_discover())
-            return false;
+        if (hp::zone2_present() == 1)
+        {
+            if (!publish_ha_climate_z2_auto_discover())
+                return false;
+        }
+        else if (hp::zone2_present() == 0)
+        {
+            remove_ha_entity(F("climate"), F("climate_control_z2"));
+        }
 
         if (!publish_ha_set_z1_flow_target_auto_discover())
             return false;
@@ -1176,22 +1212,19 @@ off
         if (!publish_ha_float_sensor_auto_discover(F("flow_rate"), SensorType::FLOW_RATE))
             return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_1"), SensorType::TEMPERATURE))
+        // 0x0E candidates (aux_temp_1..5, thermistor_raw) were boiler flow/return -> remove the entities.
+        for (size_t i = 1; i <= 5; ++i)
+            remove_ha_entity(F("sensor"), String(F("aux_temp_")) + String(i));
+        remove_ha_entity(F("sensor"), F("thermistor_raw"));
+
+        // THW10 (buffer) from GET 0x0F, compressor from GET 0x13
+        if (!publish_ha_float_sensor_auto_discover(F("buffer_temp"), SensorType::TEMPERATURE))
             return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_2"), SensorType::TEMPERATURE))
+        if (!publish_ha_binary_sensor_auto_discover(F("compressor_on")))
             return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_3"), SensorType::TEMPERATURE))
-            return false;
-
-        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_4"), SensorType::TEMPERATURE))
-            return false;
-
-        if (!publish_ha_float_sensor_auto_discover(F("aux_temp_5"), SensorType::TEMPERATURE))
-            return false;
-
-        if (!publish_ha_string_sensor_auto_discover(F("thermistor_raw")))
+        if (!publish_ha_float_sensor_auto_discover(F("compressor_runtime"), SensorType::DURATION_HOURS))
             return false;
 
         if (!publish_ha_binary_sensor_auto_discover(F("mode_dhw_forced")))
@@ -1266,14 +1299,23 @@ off
         if (!publish_ha_float_sensor_auto_discover(F("z1_room_temp_target"), SensorType::TEMPERATURE))
             return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp"), SensorType::TEMPERATURE))
-            return false;
+        if (hp::zone2_present() == 1)
+        {
+            if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp"), SensorType::TEMPERATURE))
+                return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("z2_flow_temp_target"), SensorType::TEMPERATURE))
-            return false;
+            if (!publish_ha_float_sensor_auto_discover(F("z2_flow_temp_target"), SensorType::TEMPERATURE))
+                return false;
 
-        if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp_target"), SensorType::TEMPERATURE))
-            return false;
+            if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp_target"), SensorType::TEMPERATURE))
+                return false;
+        }
+        else if (hp::zone2_present() == 0)
+        {
+            remove_ha_entity(F("sensor"), F("z2_room_temp"));
+            remove_ha_entity(F("sensor"), F("z2_flow_temp_target"));
+            remove_ha_entity(F("sensor"), F("z2_room_temp_target"));
+        }
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_temp"), SensorType::TEMPERATURE))
             return false;
@@ -1412,7 +1454,7 @@ off
         if (!publish_climate_status())
             return;
 
-        if (!publish_z2_climate_status())
+        if (hp::zone2_present() == 1 && !publish_z2_climate_status())
             return;
 
         auto& status = hp::get_status();
@@ -1426,17 +1468,16 @@ off
         if (!publish_sensor_status<float>(F("flow_rate"), status.FlowRate))
             return;
 
-        {
-            char raw[33];
-            for (size_t i = 0; i < 16; ++i)
-                sprintf(raw + i * 2, "%02X", status.ThermistorRaw[i]);
-            if (!publish_sensor_status<String>(F("thermistor_raw"), String(raw)))
-                return;
-        }
+        // THW10 + compressor (only sent once received)
+        if (status.BufferTemperatureValid && !publish_sensor_status<float>(F("buffer_temp"), status.BufferTemperature))
+            return;
 
-        for (size_t i = 0; i < 5; ++i)
+        if (status.CompressorRuntimeValid)
         {
-            if (!publish_sensor_status<float>(String(F("aux_temp_")) + String(i + 1), status.AuxiliaryTemps[i]))
+            if (!publish_binary_sensor_status(F("compressor_on"), status.CompressorOn))
+                return;
+
+            if (!publish_sensor_status<float>(F("compressor_runtime"), status.CompressorRuntimeHours))
                 return;
         }
 
@@ -1512,14 +1553,17 @@ off
         if (!publish_sensor_status<float>(F("z1_room_temp_target"), status.Zone1SetTemperature))
             return;
 
-        if (!publish_sensor_status<float>(F("z2_room_temp"), status.Zone2RoomTemperature))
-            return;
+        if (hp::zone2_present() == 1)
+        {
+            if (!publish_sensor_status<float>(F("z2_room_temp"), status.Zone2RoomTemperature))
+                return;
 
-        if (!publish_sensor_status<float>(F("z2_flow_temp_target"), status.Zone2FlowTemperatureSetPoint))
-            return;
+            if (!publish_sensor_status<float>(F("z2_flow_temp_target"), status.Zone2FlowTemperatureSetPoint))
+                return;
 
-        if (!publish_sensor_status<float>(F("z2_room_temp_target"), status.Zone2SetTemperature))
-            return;
+            if (!publish_sensor_status<float>(F("z2_room_temp_target"), status.Zone2SetTemperature))
+                return;
+        }
 
         if (!publish_sensor_status<float>(F("dhw_temp"), status.DhwTemperature))
             return;
@@ -1709,6 +1753,18 @@ off
                 {
                     publish_entity_state_updates();
                 }
+            }
+        }
+
+        // Once the DIP switches are read (zone 2 known), resend discovery once.
+        {
+            static int8_t lastZone2 = -2;
+            int8_t zone2 = hp::zone2_present();
+            if (zone2 != lastZone2)
+            {
+                if (lastZone2 != -2)
+                    needsAutoDiscover = true;
+                lastZone2 = zone2;
             }
         }
 

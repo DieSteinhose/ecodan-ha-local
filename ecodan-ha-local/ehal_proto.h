@@ -53,8 +53,10 @@ namespace ehal::hp
         SH_TEMPERATURE_STATE = 0x0B,
         DHW_TEMPERATURE_STATE_A = 0x0C,
         DHW_TEMPERATURE_STATE_B = 0x0D,
-        THERMISTOR_STATE = 0x0E,
-        ACTIVE_TIME = 0x13,
+        THERMISTOR_STATE = 0x0E,      // = boiler flow/return (gekkekoe: TEMPERATURE_STATE_C), usually unused
+        TEMPERATURE_STATE_D = 0x0F,   // bytes 1-2 = mixing tank/buffer THW10 (BE16/100)
+        DIP_SWITCHES = 0x11,          // SW1..SW7 at bytes 1,3,5,7,9,11,13
+        ACTIVE_TIME = 0x13,           // byte 1 = compressor on, bytes 3..5 = runtime [h] (gekkekoe float24_v2)
         FLOW_RATE = 0x14,
         MODE_FLAGS_A = 0x26,
         MODE_FLAGS_B = 0x28,

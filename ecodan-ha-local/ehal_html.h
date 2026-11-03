@@ -306,20 +306,28 @@ namespace ehal
         <td>Compressor:</td>
         <td>{{compressor_freq}} Hz</td>
     </tr>
+    <tr>
+        <td>Buffer / Mixing Tank (THW10):</td>
+        <td>{{buffer_temp}}&#176;C</td>
+    </tr>
+    <tr>
+        <td>Compressor Running / Runtime:</td>
+        <td>{{compressor_on}} / {{compressor_runtime}} h</td>
+    </tr>
     <thead>
-        <th colspan="2">Auxiliary Thermistors (GET 0x0E, THW10 candidates)</th>
+        <th colspan="2">Configuration &amp; Raw Data</th>
     </thead>
     <tr>
-        <td>aux_temp_1 / 2 / 3:</td>
-        <td>{{aux1}} / {{aux2}} / {{aux3}}&#176;C</td>
+        <td>Zone 2:</td>
+        <td>{{zone2}}</td>
     </tr>
     <tr>
-        <td>aux_temp_4 / 5:</td>
-        <td>{{aux4}} / {{aux5}}&#176;C</td>
+        <td>DIP Switches (1..8):</td>
+        <td><code>{{dip_switches}}</code></td>
     </tr>
     <tr>
-        <td>Raw payload:</td>
-        <td><code>{{thermistor_raw}}</code></td>
+        <td>GET 0x0F / 0x13 / 0x0E raw:</td>
+        <td><code>{{raw_0f}}</code><br /><code>{{raw_13}}</code><br /><code>{{raw_0e}}</code><br /><a href="/cn105_probe">all raw responses / probe</a></td>
     </tr>
     <thead>
         <th colspan="2">Efficiency (Last 24h)</th>

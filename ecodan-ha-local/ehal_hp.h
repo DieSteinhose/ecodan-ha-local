@@ -31,9 +31,13 @@ namespace ehal::hp
         float BoilerFlowTemperature;
         float BoilerReturnTemperature;
         uint8_t FlowRate;
-        // GET 0x0E ("several unknown temperatures"): raw bytes + 5 decoding candidates (BE16 x100 at payload 1,4,7,10,13)
-        float AuxiliaryTemps[5];
-        uint8_t ThermistorRaw[16];
+        // THW10 (buffer/mixing tank) from GET 0x0F, compressor from GET 0x13 (decoding based on
+        // github.com/gekkekoe/esphome-ecodan-hp). Contrary to the assumption, 0x0E is boiler flow/return (unused).
+        float BufferTemperature = 0.0f;
+        bool BufferTemperatureValid = false;
+        bool CompressorOn = false;
+        float CompressorRuntimeHours = 0.0f;
+        bool CompressorRuntimeValid = false;
         float DhwFlowTemperatureSetPoint;
         float RadiatorFlowTemperatureSetPoint;
 
@@ -268,6 +272,15 @@ namespace ehal::hp
     bool is_connected();
 
     uint64_t get_rx_msg_count();
+
+    // Zone 2 from DIP switches (GET 0x11): -1 = unknown yet, 0 = not present, 1 = present
+    int8_t zone2_present();
+    String dip_switches_as_string(); // e.g. "SW1 00000000 SW2 00100000 ..." (switches 1..8, left = SW x-1)
+
+    // Diagnostics - send a single GET (read-only, whitelist) and read the last raw responses
+    bool is_probe_type_allowed(uint8_t type);
+    bool request_probe(uint8_t type);
+    bool get_last_response(uint8_t type, uint8_t out[16], uint32_t& ageMs);
     uint32_t get_status_cycle_count(); // fully received status cycles since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp
