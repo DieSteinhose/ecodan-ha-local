@@ -1,5 +1,5 @@
 #include "ehal_config.h"
-#include "ehal_css.h"
+#include "ehal_css_gz.h"
 #include "ehal_diagnostics.h"
 #include "ehal_hp.h"
 #include "ehal_html.h"
@@ -526,7 +526,10 @@ namespace ehal::http
 
     void handle_milligram_css()
     {
-        server.send(200, F("text/css"), F(PAGE_CSS));
+        // gzip-compressed from flash (10 KB -> 2.4 KB), no heap copy; browsers may cache it for 1 day.
+        server.sendHeader(F("Content-Encoding"), F("gzip"));
+        server.sendHeader(F("Cache-Control"), F("max-age=86400"));
+        server.send_P(200, PSTR("text/css"), reinterpret_cast<const char*>(PAGE_CSS_GZ), PAGE_CSS_GZ_LEN);
     }
 
     void do_common_initialization()

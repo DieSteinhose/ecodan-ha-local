@@ -24,9 +24,27 @@ namespace ehal::mqtt
     template <typename T>
     bool publish_sensor_status(const String& name, T value);
     bool connect_mqtt();
+    void invalidate_published_states();
 
     std::mutex statusUpdateMtx;
     bool needsAutoDiscover = true;
+
+    // Delta publishing. For each state topic a hash of the last sent payload
+    // is stored; unchanged values are not resent. Full refresh every
+    // 10 min, after (re)connect and when Home Assistant restarts (homeassistant/status).
+    struct PublishedState
+    {
+        uint32_t topicHash;
+        uint32_t payloadHash;
+    };
+    PublishedState publishedStates[64]; // ~50 state topics; fixed table instead of a hash map (smaller code)
+    size_t publishedStateCount = 0;
+    std::chrono::steady_clock::time_point lastFullStateRefresh = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point statePublishHoldoff = std::chrono::steady_clock::now();
+    const auto FULL_STATE_REFRESH_INTERVAL = std::chrono::minutes(10);
+    const auto STATE_PUBLISH_INTERVAL = std::chrono::seconds(10);
+    const auto MQTT_RECONNECT_INTERVAL = std::chrono::seconds(30);
+    const auto DISCOVERY_SETTLE_TIME = std::chrono::seconds(5); // HA needs a moment to create the entities
     WiFiClient espClient;
     MQTTClient mqttClient(4096);
 
@@ -397,6 +415,17 @@ off
 
     void handle_mqtt_command(const String& topic, const String& payload)
     {
+        if (topic == F("homeassistant/status"))
+        {
+            if (payload == F("online"))
+            {
+                log_web(F("Home Assistant (re)started, re-publishing discovery and states"));
+                needsAutoDiscover = true;
+                invalidate_published_states();
+            }
+            return;
+        }
+
         try
         {
             auto& config = config_instance();
@@ -500,19 +529,12 @@ off
             return false;
 
         auto now = std::chrono::steady_clock::now();
-        static auto last_attempt = now + std::chrono::seconds(35);
-        static auto last_discover = now;
+        static auto last_attempt = now + std::chrono::seconds(5);
 
-        // Periodically re-publish discovery messages, just in case the broker missed them.
-        // This appears to happen if the MQTT connection is re-established after home assistant
-        // is restarted, and is still initializing.
-        if (now - last_discover > std::chrono::minutes(5))
-        {
-            last_discover = now;
-            needsAutoDiscover = true;
-        }
-
-        if ((now - last_attempt < std::chrono::seconds(30)))
+        // No more periodic re-discovery (upstream never reset needsAutoDiscover
+        // -> 52 discovery JSONs in EVERY tick). Discovery configs are now
+        // retained; they are only resent on (re)connect and HA restart (birth message).
+        if ((now - last_attempt < STATE_PUBLISH_INTERVAL))
             return false;
 
         last_attempt = now;
@@ -574,6 +596,68 @@ off
         String output;
         serializeJson(json, output);
         return publish_mqtt(topic, output, retain);
+    }
+
+    uint32_t fnv1a(const String& s)
+    {
+        uint32_t h = 2166136261u;
+        for (size_t i = 0; i < s.length(); ++i)
+        {
+            h ^= static_cast<uint8_t>(s[i]);
+            h *= 16777619u;
+        }
+        return h;
+    }
+
+    void invalidate_published_states()
+    {
+        publishedStateCount = 0;
+        lastFullStateRefresh = std::chrono::steady_clock::now();
+    }
+
+    // Sends a (non-retained) state only if it changed since it was last sent.
+    bool publish_state(const String& topic, const String& payload)
+    {
+        const uint32_t topicHash = fnv1a(topic);
+        const uint32_t payloadHash = fnv1a(payload);
+
+        PublishedState* entry = nullptr;
+        for (size_t i = 0; i < publishedStateCount; ++i)
+        {
+            if (publishedStates[i].topicHash == topicHash)
+            {
+                entry = &publishedStates[i];
+                break;
+            }
+        }
+
+        if (entry != nullptr && entry->payloadHash == payloadHash)
+            return true;
+
+        if (!publish_mqtt(topic, payload))
+        {
+            if (entry != nullptr)
+                entry->payloadHash = 0; // resend on the next tick
+            return false;
+        }
+
+        if (entry == nullptr && publishedStateCount < sizeof(publishedStates) / sizeof(publishedStates[0]))
+        {
+            entry = &publishedStates[publishedStateCount++];
+            entry->topicHash = topicHash;
+        }
+
+        if (entry != nullptr)
+            entry->payloadHash = payloadHash;
+
+        return true;
+    }
+
+    bool publish_state(const String& topic, const JsonDocument& json)
+    {
+        String output;
+        serializeJson(json, output);
+        return publish_state(topic, output);
     }
 
     bool publish_ha_climate_auto_discover()
@@ -885,7 +969,7 @@ off
         payloadJson[F("payload_on")] = F("on");
         payloadJson[F("exp_aft")] = SENSOR_STATE_TIMEOUT;
 
-        if (!publish_mqtt(discoveryTopic, doc))
+        if (!publish_mqtt(discoveryTopic, doc, /* retain =*/true))
         {
             log_web(F("Failed to publish homeassistant %s entity auto-discover"), uniqueName.c_str());
             return false;
@@ -955,7 +1039,7 @@ off
             break;
         }
 
-        if (!publish_mqtt(discoveryTopic, doc))
+        if (!publish_mqtt(discoveryTopic, doc, /* retain =*/true))
         {
             log_web(F("Failed to publish homeassistant %s entity auto-discover"), uniqueName.c_str());
             return false;
@@ -988,7 +1072,7 @@ off
             payloadJson[F("icon")] = icon;
         }
 
-        if (!publish_mqtt(discoveryTopic, doc))
+        if (!publish_mqtt(discoveryTopic, doc, /* retain =*/true))
         {
             log_web(F("Failed to publish homeassistant %s entity auto-discover"), uniqueName.c_str());
             return false;
@@ -1046,7 +1130,7 @@ off
             break;
         }
 
-        if (!publish_mqtt(discoveryTopic, doc))
+        if (!publish_mqtt(discoveryTopic, doc, /* retain =*/true))
         {
             log_web(F("Failed to publish homeassistant %s entity auto-discover"), uniqueName.c_str());
             return false;
@@ -1055,168 +1139,183 @@ off
         return true;
     }
 
-    void publish_homeassistant_auto_discover()
+    bool publish_homeassistant_auto_discover_all()
     {
-        if (!needsAutoDiscover)
-            return;
-
         // https://www.home-assistant.io/integrations/mqtt/
         if (!publish_ha_climate_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_climate_z2_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_set_z1_flow_target_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_force_dhw_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_turn_on_off_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_set_dhw_temp_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_set_sh_mode_auto_discover())
-            return;
+            return false;
 
         if (!publish_ha_binary_sensor_auto_discover(F("mode_defrost")))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("compressor_frequency"), SensorType::FREQUENCY))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("flow_rate"), SensorType::FLOW_RATE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("aux_temp_1"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("aux_temp_2"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("aux_temp_3"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("aux_temp_4"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("aux_temp_5"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_string_sensor_auto_discover(F("thermistor_raw")))
-            return;
+            return false;
 
         if (!publish_ha_binary_sensor_auto_discover(F("mode_dhw_forced")))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("output_pwr"), SensorType::LIVE_POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("legionella_prevention_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_temp_drop"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("outside_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("hp_feed_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("hp_return_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("boiler_flow_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("boiler_return_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_flow_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("sh_flow_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_string_sensor_auto_discover(F("mode_power")))
-            return;
+            return false;
 
         if (!publish_ha_string_sensor_auto_discover(F("mode_operation")))
-            return;
+            return false;
 
         if (!publish_ha_string_sensor_auto_discover(F("mode_dhw")))
-            return;
+            return false;
 
         if (!publish_ha_string_sensor_auto_discover(F("mode_heating_cooling")))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("heating_consumed"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("heating_delivered"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("cooling_consumed"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("cooling_delivered"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_consumed"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_delivered"), SensorType::POWER))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z1_room_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z1_flow_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z1_room_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z2_flow_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("z2_room_temp_target"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_temp"), SensorType::TEMPERATURE))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("dhw_cop"), SensorType::COP))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("sh_cop"), SensorType::COP))
-            return;
+            return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("cool_cop"), SensorType::COP))
-            return;
+            return false;
 
         // Diagnostic sensors
         if (!publish_ha_diagnostic_sensor_auto_discover(F("Heat pump connection state"), SensorType::CONNECTIVITY))
-            return;
+            return false;
 
         if (!publish_ha_diagnostic_sensor_auto_discover(F("Wifi signal"), SensorType::WIFI_SIGNAL))
-            return;
+            return false;
 
         if (!publish_ha_diagnostic_sensor_auto_discover(F("Wifi SSID"), SensorType::WIFI_SSID))
-            return;
+            return false;
 
         if (!publish_ha_diagnostic_sensor_auto_discover(F("IP address"), SensorType::IP_ADDRESS))
-            return;
+            return false;
 
         if (!publish_ha_diagnostic_sensor_auto_discover(F("MAC address"), SensorType::MAC_ADDRESS))
+            return false;
+
+        return true;
+    }
+
+    void publish_homeassistant_auto_discover()
+    {
+        if (!needsAutoDiscover || !mqttClient.connected())
             return;
+
+        log_web(F("Publishing Home Assistant auto-discovery..."));
+        if (publish_homeassistant_auto_discover_all())
+        {
+            needsAutoDiscover = false; // upstream never reset this
+        }
+
+        // Give HA a moment to create the entities, then send all states once.
+        invalidate_published_states();
+        statePublishHoldoff = std::chrono::steady_clock::now() + DISCOVERY_SETTLE_TIME;
     }
 
     bool publish_climate_status()
@@ -1237,7 +1336,7 @@ off
 
         const auto& config = config_instance();
         String stateTopic = config.MqttTopic + "/" + unique_entity_name(F("climate_control")) + F("/state");
-        if (!publish_mqtt(stateTopic, doc))
+        if (!publish_state(stateTopic, doc))
         {
             log_web(F("Failed to publish MQTT state for: %s"), unique_entity_name(F("climate_control")).c_str());
             return false;
@@ -1264,7 +1363,7 @@ off
 
         const auto& config = config_instance();
         String stateTopic = config.MqttTopic + "/" + unique_entity_name(F("climate_control_z2")) + F("/state");
-        if (!publish_mqtt(stateTopic, doc))
+        if (!publish_state(stateTopic, doc))
         {
             log_web(F("Failed to publish MQTT state for: %s"), unique_entity_name(F("climate_control_z2")).c_str());
             return false;
@@ -1278,7 +1377,7 @@ off
         String state = on ? F("on") : F("off");
         const auto& config = config_instance();
         String stateTopic = config.MqttTopic + "/" + unique_entity_name(name) + F("/state");
-        if (!publish_mqtt(stateTopic, state))
+        if (!publish_state(stateTopic, state))
         {
             log_web(F("Failed to publish MQTT state for: %s"), unique_entity_name(name).c_str());
             return false;
@@ -1292,7 +1391,7 @@ off
     {
         const auto& config = config_instance();
         String stateTopic = config.MqttTopic + "/" + unique_entity_name(name) + F("/state");
-        if (!publish_mqtt(stateTopic, String(value)))
+        if (!publish_state(stateTopic, String(value)))
         {
             log_web(F("Failed to publish MQTT state for: %s"), unique_entity_name(name).c_str());
             return false;
@@ -1479,6 +1578,13 @@ off
         if (mqttClient.connected())
         {
             needsAutoDiscover = true;
+            invalidate_published_states();
+
+            // HA birth message -> resend discovery + all states when HA restarts.
+            if (!mqttClient.subscribe(F("homeassistant/status")))
+            {
+                log_web(F("Failed to subscribe to homeassistant/status!"));
+            }
 
             String tempCmdTopic = config.MqttTopic + "/" + unique_entity_name(F("climate_control")) + F("/temp_cmd");
             if (!mqttClient.subscribe(tempCmdTopic))
@@ -1570,21 +1676,35 @@ off
         {
             if (periodic_update_tick())
             {
-                // If homeassistant restarts, we'll need to re-publish auto-discovery
+                auto now = std::chrono::steady_clock::now();
+
+                // Re-establish MQTT connection if we need to (at most every 30 s, blocks up to 5 s).
                 if (!mqttClient.connected())
                 {
-                    log_web(F("MQTT disconnect detected during periodic update check!"));
-                    needsAutoDiscover = true;
+                    static auto lastReconnect = now - MQTT_RECONNECT_INTERVAL;
+                    if (now - lastReconnect >= MQTT_RECONNECT_INTERVAL)
+                    {
+                        lastReconnect = now;
+                        log_web(F("MQTT disconnect detected during periodic update check!"));
+                        needsAutoDiscover = true;
+                        connect_mqtt();
+                    }
                 }
-
-                // Re-establish MQTT connection if we need to.
-                connect_mqtt();
 
                 // Publish homeassistant auto-discovery messages if we need to.
                 publish_homeassistant_auto_discover();
 
-                // Update all entity statuses.
-                publish_entity_state_updates();
+                // Periodic full refresh (in case HA missed something).
+                if (now - lastFullStateRefresh > FULL_STATE_REFRESH_INTERVAL)
+                {
+                    invalidate_published_states();
+                }
+
+                // Update entity statuses (changed values only).
+                if (now >= statePublishHoldoff)
+                {
+                    publish_entity_state_updates();
+                }
             }
         }
 
