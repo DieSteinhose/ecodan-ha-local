@@ -3,6 +3,7 @@
 #include "ehal_diagnostics.h"
 #include "ehal_hp.h"
 #include "ehal_mqtt.h"
+#include "ehal_names.h"
 #include "ehal_thirdparty.h"
 
 #include <WiFi.h>
@@ -553,6 +554,34 @@ off
         return true;
     }
 
+    // Display name for HA depending on the setting (technical / German / English).
+    // key = technical name without UniqueId; fallback = previous name.
+    String entity_display_name_for_key(const String& key, const String& fallback)
+    {
+        const auto lang = static_cast<names::Language>(config_instance().EntityNameLanguage);
+        if (lang != names::Language::GERMAN && lang != names::Language::ENGLISH)
+            return fallback;
+
+        String k = key;
+        k.replace(" ", "_");
+        for (const auto& entry : names::ENTITY_NAMES)
+        {
+            if (k == entry.key)
+                return String(lang == names::Language::GERMAN ? entry.de : entry.en);
+        }
+        return fallback; // unknown key -> technical name
+    }
+
+    String entity_display_name(const String& uniqueName)
+    {
+        // "<key>_<UniqueId>" -> "<key>"
+        String suffix = String("_") + config_instance().UniqueId;
+        String key = uniqueName;
+        if (key.endsWith(suffix))
+            key.remove(key.length() - suffix.length());
+        return entity_display_name_for_key(key, uniqueName);
+    }
+
     String unique_entity_name(const String& name)
     {
         String stringName = name;
@@ -691,7 +720,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
         payloadJson[F("icon")] = F("mdi:heat-pump-outline");
 
@@ -745,7 +774,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
         payloadJson[F("icon")] = F("mdi:heat-pump-outline");
 
@@ -799,7 +828,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
         payloadJson[F("icon")] = F("mdi:toggle-switch-variant");
 
@@ -834,7 +863,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name_for_key(F("z1_flow_temp_target_set"), uniqueName); // number entity != status sensor
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -871,7 +900,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
         payloadJson[F("icon")] = F("mdi:power");
 
@@ -903,7 +932,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -945,7 +974,7 @@ off
 
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -980,7 +1009,7 @@ off
         // https://www.home-assistant.io/integrations/binary_sensor.mqtt/
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -1009,7 +1038,7 @@ off
         // https://www.home-assistant.io/integrations/sensor.mqtt/
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -1105,7 +1134,7 @@ off
         // https://www.home-assistant.io/integrations/sensor.mqtt/
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = uniqueName;
+        payloadJson[F("name")] = entity_display_name(uniqueName);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);
@@ -1138,7 +1167,7 @@ off
         // https://www.home-assistant.io/integrations/sensor.mqtt/
         JsonDocument doc;
         JsonObject payloadJson = doc.to<JsonObject>();
-        payloadJson[F("name")] = name;
+        payloadJson[F("name")] = entity_display_name_for_key(name, name);
         payloadJson[F("unique_id")] = uniqueName;
 
         add_discovery_device_object(payloadJson);

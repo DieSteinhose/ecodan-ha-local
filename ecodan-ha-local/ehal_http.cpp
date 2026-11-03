@@ -189,6 +189,10 @@ namespace ehal::http
         page.replace(F("{{mqtt_user}}"), config.MqttUserName);
         page.replace(F("{{mqtt_pw}}"), config.MqttPassword);
         page.replace(F("{{mqtt_topic}}"), config.MqttTopic);
+        // Entity name language
+        page.replace(F("{{name_lang_0}}"), config.EntityNameLanguage == 0 ? F("selected") : F(""));
+        page.replace(F("{{name_lang_1}}"), config.EntityNameLanguage == 1 ? F("selected") : F(""));
+        page.replace(F("{{name_lang_2}}"), config.EntityNameLanguage == 2 ? F("selected") : F(""));
 
         server.send(200, F("text/html"), page);
     }
@@ -237,6 +241,16 @@ namespace ehal::http
         config.MqttUserName = server.arg(F("mqtt_user"));
         config.MqttPassword = server.arg(F("mqtt_pw"));
         config.MqttTopic = server.arg(F("mqtt_topic"));
+        // If the field is missing (e.g. old scripts), the current setting is kept.
+        if (server.hasArg(F("name_lang")))
+        {
+            long lang = server.arg(F("name_lang")).toInt();
+            config.EntityNameLanguage = (lang >= 0 && lang <= 2) ? static_cast<uint8_t>(lang) : 0;
+        }
+        else
+        {
+            config.EntityNameLanguage = config_instance().EntityNameLanguage;
+        }
         save_configuration(config);
 
         String page{F(PAGE_TEMPLATE)};

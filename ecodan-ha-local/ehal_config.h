@@ -23,6 +23,7 @@ namespace ehal
         String MqttUserName;
         String MqttPassword;
         String MqttTopic;
+        uint8_t EntityNameLanguage = 0; // 0 = technical (default), 1 = German, 2 = English
         String BootTime;
     };
 

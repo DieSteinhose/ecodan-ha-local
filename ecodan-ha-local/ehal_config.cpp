@@ -38,6 +38,7 @@ namespace ehal
         config.MqttUserName = prefs.getString("mqtt_username");
         config.MqttPassword = prefs.getString("mqtt_pw");
         config.MqttTopic = prefs.getString("mqtt_topic", "ecodan_hp");
+        config.EntityNameLanguage = prefs.getUChar("name_lang", 0);
 
         prefs.end();
 
@@ -64,6 +65,7 @@ namespace ehal
         prefs.putString("mqtt_username", config.MqttUserName);
         prefs.putString("mqtt_pw", config.MqttPassword);
         prefs.putString("mqtt_topic", config.MqttTopic);
+        prefs.putUChar("name_lang", config.EntityNameLanguage);
         prefs.end();
 
         return true;
@@ -88,9 +90,9 @@ namespace ehal
     String get_software_version()
     {
 #ifdef EHAL_VERSION_SUFFIX
-        return String(F("v0.2.3-thw10-r9")) + F(EHAL_VERSION_SUFFIX);
+        return String(F("v0.2.3-thw10-r10")) + F(EHAL_VERSION_SUFFIX);
 #else
-        return FPSTR("v0.2.3-thw10-r9");
+        return FPSTR("v0.2.3-thw10-r10");
 #endif
     }
 

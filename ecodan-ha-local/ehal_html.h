@@ -136,6 +136,15 @@ namespace ehal
         <label class="column column-25" for="mqtt_topic">MQTT Topic:</label>
         <input class="column column-75" type="text" id="mqtt_topic" name="mqtt_topic" value="{{mqtt_topic}}" required />
     </div>
+    <div class="row">
+        <label class="column column-25" for="name_lang">Home Assistant Entity Names:</label>
+        <select class="column column-75" id="name_lang" name="name_lang">
+            <option value="0" {{name_lang_0}}>Technical (e.g. hp_feed_temp_&lt;id&gt;)</option>
+            <option value="1" {{name_lang_1}}>Deutsch (German)</option>
+            <option value="2" {{name_lang_2}}>English (terms from the manual)</option>
+        </select>
+    </div>
+    <p><small>Names you changed yourself in Home Assistant always take precedence. Entity IDs never change.</small></p>
     <br />
     <div class="row">
         <input class="column column-25" id="reset" type="button" value="Restore Defaults" onclick='clear_config()' />
