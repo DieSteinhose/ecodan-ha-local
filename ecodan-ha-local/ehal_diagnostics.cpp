@@ -47,16 +47,11 @@ namespace ehal
 
         va_end(args);
 
-        std::unique_lock<std::mutex> lock(diagnosticRingbufferLock, std::try_to_lock);
-
-        auto start = std::chrono::steady_clock::now();
-        while (!lock && (std::chrono::steady_clock::now() - start) < std::chrono::seconds(10))
-        {
-            lock.try_lock();
-        }
-
-        if (!lock)
-            return;
+        // Block on the lock instead of busy-waiting. The busy-wait
+        // (up to 10 s) could starve all lower-priority tasks including idle on the single-core ESP32-S2
+        // through priority inversion (RX thread prio 5 vs. loopTask prio 1)
+        // -> task watchdog. The FreeRTOS mutex passes its priority on to the holder.
+        std::lock_guard<std::mutex> lock(diagnosticRingbufferLock);
 
         if (diagnosticRingbuffer.size() > MAX_NUM_ELEMENTS)
             diagnosticRingbuffer.pop_front();
@@ -88,15 +83,7 @@ namespace ehal
 
             va_end(args);
 
-            std::unique_lock<std::mutex> lock(diagnosticRingbufferLock, std::try_to_lock);
-
-            while (!lock && (std::chrono::steady_clock::now() - log_time) < std::chrono::seconds(10))
-            {
-                lock.try_lock();
-            }
-
-            if (!lock)
-                return;
+            std::lock_guard<std::mutex> lock(diagnosticRingbufferLock);
 
             if (diagnosticRingbuffer.size() > MAX_NUM_ELEMENTS)
                 diagnosticRingbuffer.pop_front();

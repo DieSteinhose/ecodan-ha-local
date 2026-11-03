@@ -104,6 +104,24 @@ namespace ehal::hp
             write_payload(payload, sizeof(payload));
         }
 
+        // Copyable, so a SET command can be resent after a timeout.
+        Message(const Message& other)
+        {
+            cmd_ = other.cmd_;
+            memcpy(buffer_, other.buffer_, sizeof(buffer_));
+            writeOffset_ = other.writeOffset_;
+            valid_ = other.valid_;
+        }
+
+        Message& operator=(const Message& other)
+        {
+            cmd_ = other.cmd_;
+            memcpy(buffer_, other.buffer_, sizeof(buffer_));
+            writeOffset_ = other.writeOffset_;
+            valid_ = other.valid_;
+            return *this;
+        }
+
         Message(Message&& other)
         {
             cmd_ = other.cmd_;

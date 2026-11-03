@@ -7,8 +7,9 @@
 #include <HardwareSerial.h>
 #include <freertos/task.h>
 
+#include <atomic>
+#include <deque>
 #include <mutex>
-#include <queue>
 #include <thread>
 
 namespace ehal::hp
@@ -19,12 +20,50 @@ namespace ehal::hp
 
     TaskHandle_t serialRxTaskHandle = nullptr;
     std::thread serialRxThread;
-    std::queue<Message> cmdQueue;
+
+    // ---------------------------------------------------------------------------------
+    // Command scheduling
+    //  * There is ALWAYS at most one request to the FTC in flight (awaitingResponse).
+    //    Upstream sent immediately on every SET as well -> several requests
+    //    on the bus at once, lost responses, stuck chain.
+    //  * SET commands (user) take priority over the GET status cycle and are
+    //    NO longer cleared by the status cycle.
+    //  * SETs of the same kind in the queue are replaced (only the last value counts).
+    //  * Response timeout: SETs are retried once, GETs skipped; after
+    //    several timeouts in a row the connection is re-established.
+    // ---------------------------------------------------------------------------------
+    struct PendingCmd
+    {
+        Message msg;
+        uint8_t attempts = 0;
+    };
+
+    std::deque<PendingCmd> setQueue;
+    std::deque<PendingCmd> getQueue;
     std::mutex cmdQueueMutex;
+
+    bool awaitingResponse = false;
+    PendingCmd inflight;
+    MsgType expectedResponse = MsgType::GET_RES;
+    uint8_t expectedPayloadType = 0;
+    std::chrono::steady_clock::time_point lastTxTime;
+    uint8_t consecutiveTimeouts = 0;
+
+    bool statusRefreshPending = false;
+    std::chrono::steady_clock::time_point statusRefreshDue;
+    bool statusEverRequested = false;
+    std::chrono::steady_clock::time_point lastStatusUpdate;
+
+    const auto RESPONSE_TIMEOUT = std::chrono::milliseconds(2000);  // 2x22 Byte @2400 8E1 ~ 200 ms
+    const auto STATUS_INTERVAL = std::chrono::seconds(60);
+    const auto STATUS_REFRESH_AFTER_SET = std::chrono::seconds(5);
+    const uint8_t MAX_SET_ATTEMPTS = 2;
+    const uint8_t MAX_CONSECUTIVE_TIMEOUTS = 5;
+    const size_t MAX_SET_QUEUE = 8;
 
     Status status;
     float temperatureStep = 0.5f;
-    bool connected = false;
+    std::atomic<bool> connected{false};
 
     bool serial_tx(Message& msg)
     {
@@ -42,7 +81,7 @@ namespace ehal::hp
 
         msg.set_checksum();
         port.write(msg.buffer(), msg.size());
-	port.flush();
+        port.flush();
 
         auto& config = config_instance();
         if (config.DumpPackets)
@@ -58,16 +97,17 @@ namespace ehal::hp
     {
         std::lock_guard<std::mutex> lock{cmdQueueMutex};
 
-        while (!cmdQueue.empty())
-            cmdQueue.pop();
+        setQueue.clear();
+        getQueue.clear();
+        awaitingResponse = false;
     }
 
     void resync_rx()
     {
+        // Only discard the receive buffer. The command queue is kept:
+        // a pending request runs into its timeout and is retried if needed.
         while (port.available() > 0)
             port.read();
-
-        clear_command_queue();
     }
 
     bool serial_rx(Message& msg)
@@ -113,16 +153,18 @@ namespace ehal::hp
             return false;
         }
 
-        // It shouldn't take long to receive the rest of the payload after we get the header.
+        // 17 bytes @2400 baud 8E1 take ~80 ms. Upstream waited up to 30 s here without a
+        // watchdog ping (= watchdog timeout 30 s!) -> limited to 2 s, watchdog is fed.
         size_t remainingBytes = msg.payload_size() + CHECKSUM_SIZE;
         auto startTime = std::chrono::steady_clock::now();
         while (port.available() < remainingBytes)
         {
-            delay(1);
+            delay(5);
+            ehal::ping_watchdog();
 
-            if (std::chrono::steady_clock::now() - startTime > std::chrono::seconds(30))
+            if (std::chrono::steady_clock::now() - startTime > std::chrono::seconds(2))
             {
-                log_web(F("Serial port message could not be received within 30s (got %u / %u bytes)"), port.available(), remainingBytes);
+                log_web(F("Serial port message could not be received within 2s (got %u / %u bytes)"), port.available(), remainingBytes);
                 resync_rx();
                 return false;
             }
@@ -168,24 +210,34 @@ namespace ehal::hp
         return true;
     }
 
+    // Sends the next command, but only if none is waiting for a response.
     bool dispatch_next_cmd()
     {
         Message msg;
         {
             std::lock_guard<std::mutex> lock{cmdQueueMutex};
 
-            if (cmdQueue.empty())
-            {
+            if (awaitingResponse || !connected)
                 return true;
-            }
 
-            msg = std::move(cmdQueue.front());
-            cmdQueue.pop();
+            std::deque<PendingCmd>* queue = !setQueue.empty() ? &setQueue : (!getQueue.empty() ? &getQueue : nullptr);
+            if (queue == nullptr)
+                return true;
+
+            inflight = std::move(queue->front());
+            queue->pop_front();
+            inflight.attempts++;
+
+            msg = inflight.msg;
+            expectedResponse = (msg.type() == MsgType::SET_CMD) ? MsgType::SET_RES : MsgType::GET_RES;
+            expectedPayloadType = msg[0];
+            awaitingResponse = true;
+            lastTxTime = std::chrono::steady_clock::now();
         }
 
         if (!serial_tx(msg))
         {
-            log_web(F("Unable to dispatch status update request, flushing queued requests..."));
+            log_web(F("Unable to dispatch command, flushing queued requests..."));
 
             clear_command_queue();
 
@@ -196,41 +248,148 @@ namespace ehal::hp
         return true;
     }
 
+    // Called by the RX thread on SET_RES/GET_RES. Returns true if the
+    // response matches the pending request (late responses are ignored).
+    bool complete_inflight(MsgType resType, uint8_t payloadType)
+    {
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+
+        if (!awaitingResponse || resType != expectedResponse)
+            return false;
+
+        if (resType == MsgType::GET_RES && payloadType != expectedPayloadType)
+            return false;
+
+        awaitingResponse = false;
+        consecutiveTimeouts = 0;
+        return true;
+    }
+
+    void check_response_timeout()
+    {
+        bool timedOut = false;
+        bool retried = false;
+        bool giveUp = false;
+        uint8_t type = 0;
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+
+            if (!awaitingResponse || std::chrono::steady_clock::now() - lastTxTime < RESPONSE_TIMEOUT)
+                return;
+
+            timedOut = true;
+            awaitingResponse = false;
+            type = expectedPayloadType;
+
+            if (++consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS)
+            {
+                giveUp = true;
+                consecutiveTimeouts = 0;
+            }
+            else if (inflight.msg.type() == MsgType::SET_CMD && inflight.attempts < MAX_SET_ATTEMPTS)
+            {
+                setQueue.push_front(inflight);
+                retried = true;
+            }
+        }
+
+        if (!timedOut)
+            return;
+
+        if (giveUp)
+        {
+            log_web(F("Heat pump did not answer %u requests in a row, reconnecting..."), MAX_CONSECUTIVE_TIMEOUTS);
+            {
+                // Keep user commands, only drop the status cycle.
+                std::lock_guard<std::mutex> lock{cmdQueueMutex};
+                getQueue.clear();
+            }
+            connected = false;
+            return;
+        }
+
+        log_web(F("No response for command type %#x within %ums, %s"), type, (unsigned)RESPONSE_TIMEOUT.count(),
+                retried ? "retrying" : "skipping");
+        dispatch_next_cmd();
+    }
+
+    bool enqueue_set_cmd(Message&& cmd)
+    {
+        bool accepted = false;
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+
+            // Same kind of command (type, flags, zone, control mode if any) already queued?
+            // -> only send the newest value (e.g. HA sliders, automations with several calls).
+            const bool zoneCmd = (cmd[1] & SET_SETTINGS_FLAG_ZONE_TEMPERATURE) != 0;
+            for (auto& pending : setQueue)
+            {
+                Message& m = pending.msg;
+                if (m[0] == cmd[0] && m[1] == cmd[1] && m[2] == cmd[2] && (!zoneCmd || m[6] == cmd[6]))
+                {
+                    m = std::move(cmd);
+                    pending.attempts = 0;
+                    accepted = true;
+                    break;
+                }
+            }
+
+            if (!accepted && setQueue.size() < MAX_SET_QUEUE)
+            {
+                PendingCmd pending;
+                pending.msg = std::move(cmd);
+                setQueue.push_back(std::move(pending));
+                accepted = true;
+            }
+        }
+
+        if (!accepted)
+        {
+            log_web(F("Command queue full (%u), dropping command!"), MAX_SET_QUEUE);
+            return false;
+        }
+
+        return dispatch_next_cmd();
+    }
+
     bool begin_get_status()
     {
+        size_t dropped = 0;
         {
-            std::unique_lock<std::mutex> lock{cmdQueueMutex, std::try_to_lock};
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
 
-            if (!lock)
+            // Only restart the GET cycle; pending SET commands are kept.
+            dropped = getQueue.size();
+            getQueue.clear();
+
+            const GetType types[] = {
+                GetType::DEFROST_STATE,
+                GetType::COMPRESSOR_FREQUENCY,
+                GetType::FORCED_DHW_STATE,
+                GetType::HEATING_POWER,
+                GetType::TEMPERATURE_CONFIG,
+                GetType::SH_TEMPERATURE_STATE,
+                GetType::DHW_TEMPERATURE_STATE_A,
+                GetType::DHW_TEMPERATURE_STATE_B,
+                // GetType::ACTIVE_TIME,
+                GetType::FLOW_RATE,
+                GetType::THERMISTOR_STATE,
+                GetType::MODE_FLAGS_A,
+                GetType::MODE_FLAGS_B,
+                GetType::ENERGY_USAGE,
+                GetType::ENERGY_DELIVERY,
+            };
+
+            for (auto t : types)
             {
-                log_web(F("Unable to acquire lock for status query, owned by another thread!"));
-                delay(1);
+                PendingCmd pending;
+                pending.msg = Message{MsgType::GET_CMD, t};
+                getQueue.push_back(std::move(pending));
             }
-
-            if (!cmdQueue.empty())
-            {
-                log_web(F("command queue was not empty when queueing status query: %u"), cmdQueue.size());
-
-                while (!cmdQueue.empty())
-                    cmdQueue.pop();
-            }
-
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::DEFROST_STATE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::COMPRESSOR_FREQUENCY);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::FORCED_DHW_STATE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::HEATING_POWER);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::TEMPERATURE_CONFIG);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::SH_TEMPERATURE_STATE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::DHW_TEMPERATURE_STATE_A);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::DHW_TEMPERATURE_STATE_B);
-            // cmdQueue.emplace(MsgType::GET_CMD, GetType::ACTIVE_TIME);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::FLOW_RATE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::THERMISTOR_STATE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::MODE_FLAGS_A);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::MODE_FLAGS_B);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::ENERGY_USAGE);
-            cmdQueue.emplace(MsgType::GET_CMD, GetType::ENERGY_DELIVERY);
         }
+
+        if (dropped > 0)
+            log_web(F("status query restarted, %u requests of previous cycle were still pending"), dropped);
 
         return dispatch_next_cmd();
     }
@@ -279,12 +438,7 @@ namespace ehal::hp
         cmd[2] = static_cast<uint8_t>(SetZone::ZONE_1);
         cmd.set_float16(newTemp, 10);
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for z1 temperature setting!"));
             return false;
@@ -315,12 +469,7 @@ namespace ehal::hp
         cmd.set_float16(status.Zone1SetTemperature, 10);
         cmd.set_float16(newTemp, 12);
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for z2 temperature setting!"));
             return false;
@@ -373,12 +522,7 @@ namespace ehal::hp
         cmd[6] = static_cast<uint8_t>(SetHpMode::FLOW_CONTROL_MODE);
         cmd.set_float16(newTemp, 10);
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for Z1 flow target temperature setting!"));
             return false;
@@ -407,12 +551,7 @@ namespace ehal::hp
         cmd[6] = static_cast<uint8_t>(SetHpMode::FLOW_CONTROL_MODE);
         cmd.set_float16(newTemp, 10);
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for Z2 flow target temperature setting!"));
             return false;
@@ -439,12 +578,7 @@ namespace ehal::hp
         cmd[1] = SET_SETTINGS_FLAG_DHW_TEMPERATURE;
         cmd.set_float16(newTemp, 8);
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for DHW temperature setting!"));
             return false;
@@ -470,14 +604,9 @@ namespace ehal::hp
         cmd[1] = SET_SETTINGS_FLAG_DHW_MODE;
         cmd[5] = static_cast<uint8_t>(dhwMode);
 
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
-        {
-            log_web(F("command dispatch failed for DHW temperature setting!"));
+            log_web(F("command dispatch failed for DHW mode setting!"));
             return false;
         }
 
@@ -490,12 +619,7 @@ namespace ehal::hp
         cmd[1] = SET_SETTINGS_FLAG_MODE_TOGGLE;
         cmd[3] = on ? 1 : 0; // bit[3] of payload is DHW force, bit[2] is Holiday mode.
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for DHW force setting!"));
             return false;
@@ -509,14 +633,9 @@ namespace ehal::hp
         Message cmd{MsgType::SET_CMD, SetType::BASIC_SETTINGS};
         cmd[1] = SET_SETTINGS_FLAG_MODE_TOGGLE;
         cmd[3] = on ? 1 : 0;
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
-        {
-            log_web(F("command dispatch failed for DHW force setting!"));
+            log_web(F("command dispatch failed for power mode setting!"));
             return false;
         }
 
@@ -529,12 +648,7 @@ namespace ehal::hp
         cmd[1] = SET_SETTINGS_FLAG_HP_MODE;
         cmd[6] = mode;
 
-        {
-            std::lock_guard<std::mutex> lock{cmdQueueMutex};
-            cmdQueue.emplace(std::move(cmd));
-        }
-
-        if (!dispatch_next_cmd())
+        if (!enqueue_set_cmd(std::move(cmd)))
         {
             log_web(F("command dispatch failed for heat pump mode setting!"));
             return false;
@@ -548,6 +662,20 @@ namespace ehal::hp
         if (res.type() != MsgType::SET_RES)
         {
             log_web(F("Unexpected set response type: %#x"), static_cast<uint8_t>(res.type()));
+        }
+
+        if (complete_inflight(MsgType::SET_RES, res[0]))
+        {
+            // Re-read the status shortly after a change (several SETs -> one refresh).
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+            statusRefreshPending = true;
+            statusRefreshDue = std::chrono::steady_clock::now() + STATUS_REFRESH_AFTER_SET;
+        }
+
+        // Upstream sent nothing after SET_RES -> the chain got stuck.
+        if (!dispatch_next_cmd())
+        {
+            log_web(F("Failed to dispatch next command!"));
         }
     }
 
@@ -635,6 +763,12 @@ namespace ehal::hp
             }
         }
 
+        if (!complete_inflight(MsgType::GET_RES, res.payload_type<uint8_t>()))
+        {
+            log_web(F("Ignoring unexpected/late GET response type %#x"), res.payload_type<uint8_t>());
+            return;
+        }
+
         if (!dispatch_next_cmd())
         {
             log_web(F("Failed to dispatch status update command!"));
@@ -645,7 +779,16 @@ namespace ehal::hp
     {
         log_web(F("connection reply received from heat pump"));
 
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+            awaitingResponse = false;
+            consecutiveTimeouts = 0;
+        }
+
         connected = true;
+
+        // Send any commands that arrived while disconnected.
+        dispatch_next_cmd();
     }
 
     void handle_ext_connect_response(Message& res)
@@ -757,12 +900,25 @@ namespace ehal::hp
         }
         else if (is_connected())
         {
-            // Update status the first time we enter this condition, then every 60s thereafter.
+            check_response_timeout();
+
             auto now = std::chrono::steady_clock::now();
-            static auto last_update = now - std::chrono::seconds(120);
-            if (now - last_update > std::chrono::seconds(60))
+            bool refresh = false;
             {
-                last_update = now;
+                std::lock_guard<std::mutex> lock{cmdQueueMutex};
+                if (statusRefreshPending && now >= statusRefreshDue && setQueue.empty())
+                {
+                    statusRefreshPending = false;
+                    refresh = true;
+                }
+            }
+
+            // Update status the first time we enter this condition, then every 60s thereafter
+            // (and additionally shortly after a SET command).
+            if (refresh || !statusEverRequested || now - lastStatusUpdate > STATUS_INTERVAL)
+            {
+                statusEverRequested = true;
+                lastStatusUpdate = now;
                 if (!begin_get_status())
                 {
                     log_web(F("Failed to begin heatpump status update!"));

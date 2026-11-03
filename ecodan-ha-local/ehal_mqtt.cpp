@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <string>
 #include <thread>
 
@@ -161,9 +162,11 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            status.Zone1FlowTemperatureSetPoint = setTemperature;
+            {
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.Zone1FlowTemperatureSetPoint = setTemperature;
+            }
 
             publish_sensor_status<float>(F("z1_flow_temp_target"), setTemperature);
         }
@@ -211,9 +214,11 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            status.Zone2FlowTemperatureSetPoint = setTemperature;
+            {
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.Zone2FlowTemperatureSetPoint = setTemperature;
+            }
 
             publish_sensor_status<float>(F("z2_flow_temp_target"), setTemperature);
         }
@@ -234,9 +239,14 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            status.Zone1SetTemperature = setTemperature;
+            {
+                // Upstream bug: wrote the DHW setpoint into Zone1SetTemperature (Z1 room setpoint)!
+                // Result: the Z1 thermostat showed e.g. 50 °C, and set_z2_target_temperature
+                // sent this value to the FTC as the Z1 setpoint.
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.DhwFlowTemperatureSetPoint = setTemperature;
+            }
 
             publish_sensor_status<float>(F("dhw_flow_temp_target"), setTemperature);
         }
@@ -278,11 +288,15 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            status.set_heating_cooling_mode(mode);
+            String modeStr;
+            {
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.set_heating_cooling_mode(mode);
+                modeStr = status.hp_mode_as_string();
+            }
 
-            publish_sensor_status<String>(F("mode_heating_cooling"), status.hp_mode_as_string());
+            publish_sensor_status<String>(F("mode_heating_cooling"), modeStr);
         }
     }
 
@@ -294,16 +308,20 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            if (payload == "eco")
-                status.HotWaterMode = hp::Status::DhwMode::ECO;
-            else if (payload == "performance")
-                status.HotWaterMode = hp::Status::DhwMode::NORMAL;
-            else if (payload == "off")
-                status.Operation = hp::Status::OperationMode::OFF;
+            String modeStr;
+            {
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                if (payload == "eco")
+                    status.HotWaterMode = hp::Status::DhwMode::ECO;
+                else if (payload == "performance")
+                    status.HotWaterMode = hp::Status::DhwMode::NORMAL;
+                else if (payload == "off")
+                    status.Operation = hp::Status::OperationMode::OFF;
+                modeStr = status.dhw_mode_as_string();
+            }
 
-            publish_sensor_status<String>(F("mode_dhw"), status.dhw_mode_as_string());
+            publish_sensor_status<String>(F("mode_dhw"), modeStr);
         }
     }
 
@@ -317,9 +335,11 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            status.DhwForcedActive = forced;
+            {
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.DhwForcedActive = forced;
+            }
             publish_binary_sensor_status(F("mode_dhw_forced"), forced);
         }
     }
@@ -334,21 +354,48 @@ off
         }
         else
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
-            if (turnON)
+            String powerStr;
             {
-                status.Power = hp::Status::PowerMode::ON;
+                auto& status = hp::get_status();
+                std::lock_guard<hp::Status> lock{status};
+                status.Power = turnON ? hp::Status::PowerMode::ON : hp::Status::PowerMode::STANDBY;
+                powerStr = status.power_as_string();
             }
-            else
-            {
-                status.Power = hp::Status::PowerMode::STANDBY;
-            }
-            publish_sensor_status<String>(F("mode_power"), status.power_as_string());
+            publish_sensor_status<String>(F("mode_power"), powerStr);
         }
     }
 
+    // Incoming commands are only buffered in the callback
+    // and processed after mqttClient.loop(). Upstream published directly in the callback
+    // (QoS2). lwmqtt reads further packets during publish() and calls the
+    // callback recursively -> not reentrant: acks get lost, 10 s timeouts,
+    // reconnect loops with delay() -> task watchdog reset on commands in quick
+    // succession.
+    std::deque<std::pair<String, String>> pendingCommands;
+    const size_t MAX_PENDING_COMMANDS = 16;
+
     void mqtt_callback(String& topic, String& payload)
+    {
+        // Same topic already pending -> keep only the newest value.
+        for (auto& cmd : pendingCommands)
+        {
+            if (cmd.first == topic)
+            {
+                cmd.second = payload;
+                return;
+            }
+        }
+
+        if (pendingCommands.size() >= MAX_PENDING_COMMANDS)
+        {
+            log_web(F("MQTT command backlog full, dropping: %s"), topic.c_str());
+            return;
+        }
+
+        pendingCommands.emplace_back(topic, payload);
+    }
+
+    void handle_mqtt_command(const String& topic, const String& payload)
     {
         try
         {
@@ -495,10 +542,14 @@ off
 
     bool publish_mqtt(const String& topic, const String& payload, bool retain = false)
     {
-        const int RETRY_COUNT = 3;
+        const int RETRY_COUNT = 2;
         for (int i = 0; i < RETRY_COUNT; ++i)
         {
-            if (mqttClient.publish(topic, payload, retain, static_cast<int>(LWMQTT_QOS2)))
+            ehal::ping_watchdog();
+
+            // QoS1 instead of QoS2: one round trip per message instead of two, much shorter
+            // blocking time of the loopTask (state values are re-sent periodically anyway).
+            if (mqttClient.publish(topic, payload, retain, static_cast<int>(LWMQTT_QOS1)))
             {
                 return true;
             }
@@ -1401,46 +1452,28 @@ off
         if (mqttClient.connected())
             return true;
 
+        // Exactly one connection attempt. Upstream tried up to 11x with
+        // delay(1000) + up to 10 s timeout each, without a watchdog ping (watchdog = 30 s).
+        // Retries happen via the periodic tick (every 30 s).
         Config& config = config_instance();
+        ehal::ping_watchdog();
+        bool ok;
         if (!config.MqttPassword.isEmpty() && !config.MqttUserName.isEmpty())
         {
             log_web(F("MQTT user '%s' has configured password, connecting with credentials..."), config.MqttUserName.c_str());
-            int mqtt_connection_retries = 0;
-            while (!mqttClient.connect(WiFi.localIP().toString().c_str(), config.MqttUserName.c_str(), config.MqttPassword.c_str())) 
-            {
-                log_web(F("Connecting to MQTT server ..."));
-                delay(1000);
-                if (mqtt_connection_retries > 10) 
-                {
-                    break;
-                }
-                mqtt_connection_retries++;
-            }
-            if (mqtt_connection_retries > 10)
-            {
-                log_web(F("MQTT connection failure: '%s'"), get_connection_error_string().c_str());
-                return false;
-            }
+            ok = mqttClient.connect(WiFi.localIP().toString().c_str(), config.MqttUserName.c_str(), config.MqttPassword.c_str());
         }
         else
         {
             log_web(F("MQTT username/password not configured, connecting as anonymous user..."));
-            int mqtt_connection_retries = 0;
-            while (!mqttClient.connect(WiFi.localIP().toString().c_str())) 
-            {
-                log_web(F("Connecting to MQTT server ..."));
-                delay(1000);
-                if (mqtt_connection_retries > 10) 
-                {
-                    break;
-                }
-                mqtt_connection_retries++;
-            }
-            if (mqtt_connection_retries > 10)
-            {
-                log_web(F("MQTT connection failure: '%s'"), get_connection_error_string().c_str());
-                return false;
-            }
+            ok = mqttClient.connect(WiFi.localIP().toString().c_str());
+        }
+        ehal::ping_watchdog();
+
+        if (!ok)
+        {
+            log_web(F("MQTT connection failure: '%s'"), get_connection_error_string().c_str());
+            return false;
         }
 
         if (mqttClient.connected())
@@ -1518,7 +1551,7 @@ off
         
         const int KEEPALIVE_TIME_SECONDS = 90;
         const bool USE_CLEAN_SESSION = false; // Persistent MQTT session
-        const int COMMAND_TIMEOUT_MILLISECONDS = 10000;
+        const int COMMAND_TIMEOUT_MILLISECONDS = 5000; // LAN: 10 s was unnecessarily long (blocks loopTask)
         mqttClient.setOptions(KEEPALIVE_TIME_SECONDS, USE_CLEAN_SESSION, COMMAND_TIMEOUT_MILLISECONDS);
         mqttClient.onMessage(mqtt_callback);
         mqttClient.begin(config.MqttServer.c_str(), config.MqttPort, espClient);
@@ -1556,6 +1589,16 @@ off
         }
 
         mqttClient.loop();
+
+        // Process buffered commands outside the lwmqtt callback.
+        // (Commands arriving during publish() are appended to the queue.)
+        while (!pendingCommands.empty())
+        {
+            auto cmd = std::move(pendingCommands.front());
+            pendingCommands.pop_front();
+            handle_mqtt_command(cmd.first, cmd.second);
+            ehal::ping_watchdog();
+        }
     }
 
     bool is_connected()
