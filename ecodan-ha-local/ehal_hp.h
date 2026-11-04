@@ -305,6 +305,10 @@ namespace ehal::hp
     bool get_request_code_parallel();
     void get_request_code_stats(RcStats& single, RcStats& parallel);
     void reset_request_code_stats();
+
+    // Outdoor unit request code values
+    bool get_request_code_value(int16_t code, uint16_t& value, uint32_t& ageS);
+    String request_code_status_text(int16_t code, uint16_t value);
     uint32_t get_status_cycle_count(); // fully received status cycles since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp

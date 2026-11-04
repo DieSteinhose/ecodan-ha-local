@@ -49,6 +49,10 @@ namespace ehal::mqtt
     static_assert(120 + 10 < SENSOR_STATE_TIMEOUT, "full refresh (+tick) must happen before exp_aft");
     const auto STATE_PUBLISH_INTERVAL = std::chrono::seconds(10);
     const auto MQTT_RECONNECT_INTERVAL = std::chrono::seconds(30);
+    // Max. age of outdoor unit values that are still sent (rotation: fast ~30 s, slow 5 min, hourly)
+    const uint32_t RC_MAX_AGE_FAST_S = 120;
+    const uint32_t RC_MAX_AGE_SLOW_S = 420;
+    const uint32_t RC_MAX_AGE_HOURLY_S = 3900;
     const auto DISCOVERY_SETTLE_TIME = std::chrono::seconds(5); // HA needs a moment to create the entities
     WiFiClient espClient;
     MQTTClient mqttClient(4096);
@@ -63,6 +67,8 @@ namespace ehal::mqtt
         DURATION_HOURS,
         DURATION_MINUTES,
         COUNT,
+        CURRENT,
+        KELVIN_DIFF,    // temperature difference (superheat/subcool)
         COP,
         CONNECTIVITY,
         WIFI_SIGNAL,
@@ -1093,6 +1099,18 @@ off
             payloadJson[F("dev_cla")] = F("duration");
             break;
 
+        case SensorType::CURRENT:
+            payloadJson[F("unit_of_meas")] = F("A");
+            payloadJson[F("stat_cla")] = F("measurement");
+            payloadJson[F("dev_cla")] = F("current");
+            break;
+
+        case SensorType::KELVIN_DIFF:
+            payloadJson[F("unit_of_meas")] = F("K");
+            payloadJson[F("icon")] = F("mdi:thermometer-lines");
+            payloadJson[F("stat_cla")] = F("measurement");
+            break;
+
         case SensorType::COUNT:
             payloadJson[F("icon")] = F("mdi:counter");
             payloadJson[F("stat_cla")] = F("total_increasing");
@@ -1275,6 +1293,32 @@ off
             return false;
 
         if (!publish_ha_float_sensor_auto_discover(F("compressor_avg_run"), SensorType::DURATION_MINUTES))
+            return false;
+
+        // Outdoor unit (request codes OCH694A)
+        if (!publish_ha_float_sensor_auto_discover(F("outdoor_target_freq"), SensorType::FREQUENCY))
+            return false;
+        if (!publish_ha_string_sensor_auto_discover(F("freq_limitation"), F("mdi:speedometer-slow")))
+            return false;
+        if (!publish_ha_binary_sensor_auto_discover(F("freq_limited")))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("thermo_on_time"), SensorType::DURATION_MINUTES))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("discharge_temp"), SensorType::TEMPERATURE))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("compressor_current"), SensorType::CURRENT))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("discharge_superheat"), SensorType::KELVIN_DIFF))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("subcool"), SensorType::KELVIN_DIFF))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("outdoor_ambient_temp"), SensorType::TEMPERATURE))
+            return false;
+        if (!publish_ha_string_sensor_auto_discover(F("outdoor_actuators"), F("mdi:electric-switch")))
+            return false;
+        if (!publish_ha_string_sensor_auto_discover(F("outdoor_control_state"), F("mdi:state-machine")))
+            return false;
+        if (!publish_ha_float_sensor_auto_discover(F("outdoor_compressor_hours"), SensorType::DURATION_HOURS))
             return false;
 
         if (!publish_ha_binary_sensor_auto_discover(F("mode_dhw_forced")))
@@ -1531,13 +1575,58 @@ off
                 return;
         }
 
+        // Prefer operating hours from the outdoor unit (code 2, x10 h); the FTC counter 0x13 can read lower
+        float outdoorHours = 0.0f;
+        {
+            uint16_t v = 0;
+            uint32_t age = 0;
+            if (hp::get_request_code_value(2, v, age) && age <= RC_MAX_AGE_HOURLY_S)
+                outdoorHours = float(v) * 10.0f;
+        }
+
         if (status.CompressorStartsValid && status.CompressorStarts > 0)
         {
             if (!publish_sensor_status<float>(F("compressor_starts"), float(status.CompressorStarts)))
                 return;
 
-            if (status.CompressorRuntimeValid &&
-                !publish_sensor_status<float>(F("compressor_avg_run"), status.CompressorRuntimeHours * 60.0f / float(status.CompressorStarts)))
+            const float hours = outdoorHours > 0.0f ? outdoorHours : (status.CompressorRuntimeValid ? status.CompressorRuntimeHours : 0.0f);
+            if (hours > 0.0f &&
+                !publish_sensor_status<float>(F("compressor_avg_run"), hours * 60.0f / float(status.CompressorStarts)))
+                return;
+        }
+
+        // Outdoor unit values - only sent while fresh (otherwise the HA sensor goes unavailable via exp_aft)
+        {
+            uint16_t v = 0;
+            uint32_t age = 0;
+            auto fresh = [&](int16_t code, uint32_t maxAge) { return hp::get_request_code_value(code, v, age) && age <= maxAge; };
+
+            if (fresh(17, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("outdoor_target_freq"), float(v)))
+                return;
+            if (fresh(52, RC_MAX_AGE_FAST_S))
+            {
+                if (!publish_sensor_status<String>(F("freq_limitation"), hp::request_code_status_text(52, v)))
+                    return;
+                if (!publish_binary_sensor_status(F("freq_limited"), v != 0))
+                    return;
+            }
+            if (fresh(48, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("thermo_on_time"), float(v)))
+                return;
+            if (fresh(4, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("discharge_temp"), float(int16_t(v))))
+                return;
+            if (fresh(1, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("compressor_current"), float(v)))
+                return;
+            if (fresh(12, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("discharge_superheat"), float(v)))
+                return;
+            if (fresh(13, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("subcool"), float(v)))
+                return;
+            if (fresh(9, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("outdoor_ambient_temp"), float(int16_t(v))))
+                return;
+            if (fresh(54, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<String>(F("outdoor_actuators"), hp::request_code_status_text(54, v)))
+                return;
+            if (fresh(51, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<String>(F("outdoor_control_state"), hp::request_code_status_text(51, v)))
+                return;
+            if (outdoorHours > 0.0f && !publish_sensor_status<float>(F("outdoor_compressor_hours"), outdoorHours))
                 return;
         }
 

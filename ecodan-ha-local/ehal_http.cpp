@@ -404,42 +404,18 @@ namespace ehal::http
         uint32_t ageMs = 0;
         if (!hp::get_request_code_result(code, raw, state, tries, gaveUp, ageMs) || state == 0)
             return String();
+        if (state == 6)
+            return F("n/a"); // format 6 = not available
         ageS = ageMs / 1000;
         const uint16_t u = uint16_t(raw[4]) | (uint16_t(raw[5]) << 8);
-        const uint8_t d1 = u & 0x0F;         // state (1) = rightmost hex digit
-        const uint8_t d2 = (u >> 4) & 0x0F;  // state (2)
 
         switch (code)
         {
-        case 52: // OCH694A 10-1-1: (1) current limit, (2) protection controls (bit mask)
-        {
-            String s;
-            if (d1 & 1) s += F("discharge temp. overheat prev., ");
-            if (d1 & 2) s += F("condensation temp. overheat prev., ");
-            if (d1 & 4) s += F("anti-freeze protection, ");
-            if (d1 & 8) s += F("heat sink overheat prev., ");
-            if (d2 == 1) s += F("primary current limit, ");
-            if (d2 == 2) s += F("secondary current limit, ");
-            if (s.isEmpty()) return F("none");
-            s.remove(s.length() - 2);
-            return s;
-        }
+        case 52:
         case 54:
-        {
-            String s;
-            if (d1 & 1) s += F("SV1, ");
-            if (d1 & 2) s += F("4-way valve, ");
-            if (d1 & 4) s += F("compressor, ");
-            if (d1 & 8) s += F("compressor warming up, ");
-            if (d2 & 1) s += F("52C, ");
-            if (d2 & 2) s += F("SV2, ");
-            if (d2 & 4) s += F("SS, ");
-            if (s.isEmpty()) return F("all off");
-            s.remove(s.length() - 2);
-            return s + F(" ON");
-        }
+            return hp::request_code_status_text(code, u) + (code == 54 && u != 0 ? String(F(" ON")) : String());
         case 51:
-            return u == 0 ? String(F("normal")) : u == 1 ? String(F("preparing heat operation")) : u == 2 ? String(F("defrost")) : String(u, HEX);
+            return hp::request_code_status_text(code, u);
         case 2:
             return String((unsigned long)u * 10) + F(" h");
         case 3:
@@ -497,7 +473,7 @@ namespace ehal::http
     String outdoor_unit_rows()
     {
         String t;
-        t += rc_row(F("Compressor Target / Actual Freq. (17/16):"), {17, 16});
+        t += rc_row(F("Compressor Target / Actual Freq. (17/16):"), {17, 16});  // 16 on request only (actual frequency comes via 0x04)
         t += rc_row(F("Frequency Limitation (52):"), {52});
         t += rc_row(F("Thermo ON Time (48):"), {48});
         t += rc_row(F("Discharge Temp. TH4 (4):"), {4});
@@ -509,7 +485,7 @@ namespace ehal::http
         t += rc_row(F("Actuators (54):"), {54});
         t += rc_row(F("Control State (51):"), {51});
         t += rc_row(F("Compressor Operating Time / Starts (2/3):"), {2, 3});
-        t += F("<tr><td colspan=\"2\"><small>Live: 17, 16, 52, 48, 4, 1 in rotation (~5-8 s per code); 2, 3 hourly; others on demand: "
+        t += F("<tr><td colspan=\"2\"><small>Live: 17, 52, 48 in rotation (~5-8 s per code); 4, 1, 12, 13, 9, 54, 51 every 5 min; 2, 3 hourly; others on demand: "
                "<a href=\"/cn105_rc?rc=all\">query all</a> (~6 min) &middot; <a href=\"/cn105_rc\">raw table &amp; statistics</a></small></td></tr>");
         return t;
     }
@@ -551,8 +527,15 @@ namespace ehal::http
             // Compressor starts
             const bool startsOk = status.CompressorStartsValid && status.CompressorStarts > 0;
             page.replace(F("{{compressor_starts}}"), startsOk ? String(status.CompressorStarts) : String(F("?")));
-            page.replace(F("{{compressor_avg_run}}"), (startsOk && status.CompressorRuntimeValid)
-                ? String(status.CompressorRuntimeHours * 60.0f / float(status.CompressorStarts), 1) : String(F("?")));
+            {
+                // Prefer the outdoor unit's operating hours (code 2, x10 h); the FTC counter 0x13 can read lower
+                uint16_t v2 = 0;
+                uint32_t a2 = 0;
+                float hours = hp::get_request_code_value(2, v2, a2) ? float(v2) * 10.0f
+                            : (status.CompressorRuntimeValid ? status.CompressorRuntimeHours : 0.0f);
+                page.replace(F("{{compressor_avg_run}}"), (startsOk && hours > 0.0f)
+                    ? String(hours * 60.0f / float(status.CompressorStarts), 1) : String(F("?")));
+            }
 
             page.replace(F("{{sh_consumed}}"), String(status.EnergyConsumedHeating));
             page.replace(F("{{sh_delivered}}"), String(status.EnergyDeliveredHeating));

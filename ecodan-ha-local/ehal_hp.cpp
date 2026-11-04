@@ -84,13 +84,19 @@ namespace ehal::hp
         std::chrono::steady_clock::time_point last;
         bool everRun;
     };
+    // Fast group (every round) / slow group (5 min) / hourly.
+    // 16 (actual frequency) is skipped - already provided by GET 0x04 (compressor_frequency).
     RcPoll rcPoll[] = {
         {17, 0, {}, false},    // compressor target frequency
-        {16, 0, {}, false},    // compressor actual frequency
         {52, 0, {}, false},    // frequency control state (limitation)
         {48, 0, {}, false},    // thermo ON time
-        {4, 0, {}, false},     // discharge temp. TH4
-        {1, 0, {}, false},     // compressor current
+        {4, 300, {}, false},   // discharge temp. TH4
+        {1, 300, {}, false},   // compressor current
+        {12, 300, {}, false},  // discharge superheat SHd
+        {13, 300, {}, false},  // sub-cool SC
+        {9, 300, {}, false},   // ambient TH7 (outdoor unit)
+        {54, 300, {}, false},  // actuators
+        {51, 300, {}, false},  // control state
         {3, 3600, {}, false},  // compressor starts (x100)
         {2, 3600, {}, false},  // compressor operating time (x10 h)
     };
@@ -1393,6 +1399,59 @@ namespace ehal::hp
         memcpy(raw, r.raw, PAYLOAD_SIZE);
         ageMs = millis() - r.when;
         return true;
+    }
+
+    // Valid value (format != 0/6) of a request code incl. age
+    bool get_request_code_value(int16_t code, uint16_t& value, uint32_t& ageS)
+    {
+        uint8_t raw[16];
+        uint8_t state = 0, tries = 0;
+        bool gaveUp = false;
+        uint32_t ageMs = 0;
+        if (!get_request_code_result(code, raw, state, tries, gaveUp, ageMs) || state == 0 || state == 6)
+            return false;
+        value = uint16_t(raw[4]) | (uint16_t(raw[5]) << 8);
+        ageS = ageMs / 1000;
+        return true;
+    }
+
+    // Plain text for status codes (OCH694A 10-1-1). Rightmost hex digit = state (1), the one left of it = state (2).
+    String request_code_status_text(int16_t code, uint16_t u)
+    {
+        const uint8_t d1 = u & 0x0F;
+        const uint8_t d2 = (u >> 4) & 0x0F;
+        String s;
+        switch (code)
+        {
+        case 52:
+            if (d1 & 1) s += F("discharge temp. overheat prevention, ");
+            if (d1 & 2) s += F("condensation temp. overheat prevention, ");
+            if (d1 & 4) s += F("anti-freeze protection, ");
+            if (d1 & 8) s += F("heat sink overheat prevention, ");
+            if (d2 == 1) s += F("primary current limit, ");
+            if (d2 == 2) s += F("secondary current limit, ");
+            if (s.isEmpty()) return F("none");
+            s.remove(s.length() - 2);
+            return s;
+        case 54:
+            if (d1 & 1) s += F("SV1, ");
+            if (d1 & 2) s += F("4-way valve, ");
+            if (d1 & 4) s += F("compressor, ");
+            if (d1 & 8) s += F("compressor warming up, ");
+            if (d2 & 1) s += F("52C, ");
+            if (d2 & 2) s += F("SV2, ");
+            if (d2 & 4) s += F("SS, ");
+            if (s.isEmpty()) return F("all off");
+            s.remove(s.length() - 2);
+            return s;
+        case 51:
+            if (u == 0) return F("normal");
+            if (u == 1) return F("preparing heat operation");
+            if (u == 2) return F("defrost");
+            return String(u, HEX);
+        default:
+            return String(u);
+        }
     }
 
     bool is_probe_type_allowed(uint8_t type)

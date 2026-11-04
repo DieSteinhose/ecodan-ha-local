@@ -67,9 +67,23 @@ namespace ehal::names
         // Compressor (OCH694A)
         {"compressor_frequency",       "Verdichter Frequenz",                          "Compressor operating frequency"},
         {"compressor_on",              "Verdichter EIN",                               "Compressor ON"},
-        {"compressor_runtime",         "Verdichter Betriebsstunden",                   "Compressor accumulated operating time"},
+        {"compressor_runtime",         "Verdichter Betriebsstunden (FTC)",             "Compressor accumulated operating time (FTC)"},
         {"compressor_starts",          "Verdichter Anzahl Starts",                     "Compressor number of operation times"},
         {"compressor_avg_run",         "Verdichter Laufzeit pro Start",                "Compressor run time per start"},
+
+        // Outdoor unit, request codes (OCH694A table 10-1; German terms from the manual: Heissgas, Verdichter)
+        {"outdoor_target_freq",        "Verdichter Sollfrequenz",                      "Compressor target operating frequency"},
+        {"freq_limitation",            "Verdichter Frequenzregelzustand",              "Compressor frequency control state"},
+        {"freq_limited",               "Verdichter Frequenzbegrenzung aktiv",          "Compressor frequency limited"},
+        {"thermo_on_time",             "Thermo-EIN Laufzeit",                          "Thermostat ON operating time"},
+        {"discharge_temp",             "Heißgastemperatur (TH4)",                      "Discharge temp. (TH4)"},
+        {"compressor_current",         "Verdichter Betriebsstrom",                     "Compressor operating current"},
+        {"discharge_superheat",        "Heißgas-Überhitzung (SHd)",                    "Discharge superheat (SHd)"},
+        {"subcool",                    "Unterkühlung (SC)",                            "Sub-cool (SC)"},
+        {"outdoor_ambient_temp",       "Außengerät Lufttemperatur (TH7)",              "Outdoor unit ambient temp. (TH7)"},
+        {"outdoor_actuators",          "Außengerät Ausgänge",                          "Outdoor unit actuator output state"},
+        {"outdoor_control_state",      "Außengerät Regelzustand",                      "Outdoor unit control state"},
+        {"outdoor_compressor_hours",   "Verdichter Betriebsstunden (Außengerät)",      "Compressor accumulated operating time (outdoor unit)"},
 
         // Energy monitor
         {"heating_consumed",           "Heizen verbrauchte elektr. Energie",           "Heating consumed electrical energy"},
