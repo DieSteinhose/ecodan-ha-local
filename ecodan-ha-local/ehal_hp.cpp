@@ -36,11 +36,6 @@ namespace ehal::hp
     // 340-363 = counter reset/forced operation!) is unknown -> no code outside this
     // list may ever be sent. A 0xA3 message is only ever created in make_request_code_msg().
     // ---------------------------------------------------------------------------------
-    // Periodically queried codes (subset of RC_READ_CODES).
-    const int16_t REQUEST_CODE_WHITELIST[] = {
-        3, // Compressor-Number of operation times, 0..9999, unit 100 starts
-    };
-
     // ALL codes documented in OCH694A table 10-1 (PUD-SWM/SHWM, R32) - read-only codes according to the manual.
     // Only these may ever be sent (periodically or via diagnostics /cn105_rc).
     const int16_t RC_READ_CODES[] = {
@@ -62,15 +57,46 @@ namespace ehal::hp
     };
     RcResult rcResults[RC_MAX_CODE + 1];
     std::deque<int16_t> rcProbeQueue;
-    const auto REQUEST_CODE_INTERVAL = std::chrono::minutes(10);
-    const auto REQUEST_CODE_RETRY = std::chrono::milliseconds(1500);
-    const uint8_t REQUEST_CODE_MAX_TRIES = 10;
+    // Retry interval 1 s like gekkekoe (measured: the outdoor unit answers after 5-8 s, time-based).
+    const auto REQUEST_CODE_RETRY = std::chrono::milliseconds(1000);
+    const uint8_t REQUEST_CODE_MAX_TRIES = 12;
+    const auto REQUEST_CODE_START_DELAY = std::chrono::seconds(30);
 
-    std::atomic<int16_t> rcActive{-1}; // -1 = no query active (code 0 is a valid code!); also read by the RX thread
-    uint8_t rcTries = 0;
-    std::chrono::steady_clock::time_point rcNextTry;
-    std::chrono::steady_clock::time_point rcLastCycle;
+    // Query slots. Normally 1 slot; in the parallel test 2 slots (alternating A, B, A, B ...).
+    struct RcSlot
+    {
+        int16_t code = -1; // -1 = free (code 0 is valid!)
+        uint8_t tries = 0;
+        std::chrono::steady_clock::time_point nextTry;
+        uint32_t startMs = 0;
+        bool parallel = false; // started while 2 slots were active
+    };
+    RcSlot rcSlots[2];
+    std::atomic<bool> rcParallel{false};
+    RcStats rcStatsSingle;
+    RcStats rcStatsParallel;
+
+    // Rotation (continuous polling). intervalS 0 = every round, otherwise at most every intervalS seconds.
+    struct RcPoll
+    {
+        int16_t code;
+        uint32_t intervalS;
+        std::chrono::steady_clock::time_point last;
+        bool everRun;
+    };
+    RcPoll rcPoll[] = {
+        {17, 0, {}, false},    // compressor target frequency
+        {16, 0, {}, false},    // compressor actual frequency
+        {52, 0, {}, false},    // frequency control state (limitation)
+        {48, 0, {}, false},    // thermo ON time
+        {4, 0, {}, false},     // discharge temp. TH4
+        {1, 0, {}, false},     // compressor current
+        {3, 3600, {}, false},  // compressor starts (x100)
+        {2, 3600, {}, false},  // compressor operating time (x10 h)
+    };
+    size_t rcPollIndex = 0;
     bool rcEverStarted = false;
+    std::chrono::steady_clock::time_point rcStartAfter;
 
     bool is_request_code_whitelisted(int16_t code)
     {
@@ -827,31 +853,45 @@ namespace ehal::hp
             {
                 const int16_t code = static_cast<int16_t>((uint16_t(res[1]) << 8) | res[2]);
                 const uint8_t state = res[3];
-                if (is_request_code_whitelisted(code) && code >= 0 && code <= RC_MAX_CODE)
+                if (!is_request_code_whitelisted(code) || code < 0 || code > RC_MAX_CODE)
+                    break;
+
+                std::lock_guard<std::mutex> rcLock{cmdQueueMutex}; // lock order status -> cmdQueue (never the other way round)
+                RcResult& r = rcResults[code];
+                // Byte 3 = DISPLAY FORMAT (1 hex/code, 2 decimal, 3 error code, 4 operation mode, 6 n/a); 0 = not ready yet.
+                // An intermediate format-0 reply never overwrites a valid old value.
+                if (state != 0 || r.when == 0 || r.state == 0)
                 {
-                    std::lock_guard<std::mutex> rcLock{cmdQueueMutex}; // lock order status -> cmdQueue (never the other way round)
-                    RcResult& r = rcResults[code];
                     memcpy(r.raw, res.payload(), PAYLOAD_SIZE);
                     r.state = state;
                     uint32_t now = millis();
                     r.when = now == 0 ? 1 : now;
                 }
-                if (code != rcActive || !is_request_code_whitelisted(code))
-                    break; // no query or a different query active
-                // Byte 3 is the DISPLAY FORMAT (observed: 1 = hex/code, 2 = decimal, 3 = error code,
-                // 4 = operation mode display, 6 = n/a). Only 0 = "outdoor unit not ready yet".
-                // (gekkekoe only accepts 1/2 -> codes with format 3/4/6 were retried 10x.)
-                if (state != 0)
+
+                if (state == 0)
+                    break; // handle_request_codes() retries
+
+                for (auto& slot : rcSlots)
+                {
+                    if (slot.code != code)
+                        continue;
+                    RcStats& st = slot.parallel ? rcStatsParallel : rcStatsSingle;
+                    uint32_t elapsed = millis() - slot.startMs;
+                    st.count++;
+                    st.sumMs += elapsed;
+                    st.sumTries += slot.tries;
+                    if (elapsed > st.maxMs)
+                        st.maxMs = elapsed;
+                    r.gaveUp = false;
+                    slot.code = -1;
+                }
+
+                if (code == 3)
                 {
                     const uint16_t value = uint16_t(res[4]) | (uint16_t(res[5]) << 8); // Little-Endian
-                    if (code == 3)
-                    {
-                        status.CompressorStarts = uint32_t(value) * 100;
-                        status.CompressorStartsValid = true;
-                    }
-                    rcActive = -1;
+                    status.CompressorStarts = uint32_t(value) * 100;
+                    status.CompressorStartsValid = true;
                 }
-                // state 0: outdoor unit has not answered yet -> handle_loop retries
                 break;
             }
             case GetType::ACTIVE_TIME:
@@ -1044,84 +1084,143 @@ namespace ehal::hp
         return true;
     }
 
-    // Periodic query of whitelisted request codes (currently code 3 only).
+    // Pick the next code for a free slot (diagnostic queue before rotation). Lock held.
+    int16_t rc_pick_next_code(std::chrono::steady_clock::time_point now)
+    {
+        auto busy = [](int16_t c) {
+            for (const auto& slot : rcSlots)
+                if (slot.code == c)
+                    return true;
+            return false;
+        };
+
+        while (!rcProbeQueue.empty())
+        {
+            int16_t c = rcProbeQueue.front();
+            rcProbeQueue.pop_front();
+            if (!busy(c))
+                return c;
+        }
+
+        if (now < rcStartAfter)
+            return -1;
+
+        const size_t n = sizeof(rcPoll) / sizeof(rcPoll[0]);
+        for (size_t i = 0; i < n; ++i)
+        {
+            RcPoll& p = rcPoll[rcPollIndex];
+            rcPollIndex = (rcPollIndex + 1) % n;
+            if (busy(p.code))
+                continue;
+            if (p.intervalS > 0 && p.everRun && now - p.last < std::chrono::seconds(p.intervalS))
+                continue;
+            p.last = now;
+            p.everRun = true;
+            return p.code;
+        }
+        return -1;
+    }
+
+    // Process request codes in 1 or 2 slots. At most one request per call.
     void handle_request_codes()
     {
         auto now = std::chrono::steady_clock::now();
         Message msg;
         bool send = false;
+        int16_t failed = -1;
         {
             std::lock_guard<std::mutex> lock{cmdQueueMutex};
 
-            if (rcActive == -1 && !rcProbeQueue.empty())
+            if (!rcEverStarted)
             {
-                // Diagnostic queries take priority (up to 10 attempts per code)
-                rcActive = rcProbeQueue.front();
-                rcProbeQueue.pop_front();
-                rcTries = 0;
-                rcNextTry = now;
-                if (rcActive >= 0 && rcActive <= RC_MAX_CODE)
-                {
-                    rcResults[rcActive].gaveUp = false;
-                    rcResults[rcActive].tries = 0;
-                }
+                rcEverStarted = true;
+                rcStartAfter = now + REQUEST_CODE_START_DELAY;
             }
 
-            if (rcActive == -1)
+            const size_t slotsInUse = rcParallel ? 2 : 1;
+
+            // fill free slots
+            for (size_t i = 0; i < slotsInUse; ++i)
             {
-                // First query 30 s after connecting, then every 10 min.
-                if (!rcEverStarted)
-                {
-                    rcEverStarted = true;
-                    rcLastCycle = now - REQUEST_CODE_INTERVAL + std::chrono::seconds(30);
-                }
-                if (now - rcLastCycle < REQUEST_CODE_INTERVAL)
-                    return;
-                rcLastCycle = now;
-                rcActive = REQUEST_CODE_WHITELIST[0];
-                rcTries = 0;
-                rcNextTry = now;
+                RcSlot& slot = rcSlots[i];
+                if (slot.code != -1)
+                    continue;
+                int16_t c = rc_pick_next_code(now);
+                if (c == -1)
+                    break;
+                slot.code = c;
+                slot.tries = 0;
+                slot.startMs = millis();
+                // in parallel mode offset the second slot by half a period -> A, B, A, B ...
+                slot.nextTry = now + ((i == 1) ? REQUEST_CODE_RETRY / 2 : std::chrono::milliseconds(0));
+                rcResults[c].tries = 0;
             }
 
-            if (now < rcNextTry)
-                return;
+            // serve the slot that is due
+            for (size_t i = 0; i < 2 && !send; ++i)
+            {
+                RcSlot& slot = rcSlots[i];
+                if (slot.code == -1 || now < slot.nextTry)
+                    continue;
 
-            if (rcTries >= REQUEST_CODE_MAX_TRIES)
-            {
-                // Lock is released below, log afterwards.
-                int16_t c = rcActive;
-                if (c >= 0 && c <= RC_MAX_CODE)
-                    rcResults[c].gaveUp = true;
-                rcActive = -1;
-            }
-            else if (make_request_code_msg(rcActive, msg))
-            {
-                ++rcTries;
+                slot.parallel = slot.parallel || (rcSlots[0].code != -1 && rcSlots[1].code != -1);
+
+                if (slot.tries >= REQUEST_CODE_MAX_TRIES)
                 {
-                    int16_t c = rcActive;
-                    if (c >= 0 && c <= RC_MAX_CODE)
-                        rcResults[c].tries = rcTries;
+                    failed = slot.code;
+                    rcResults[slot.code].gaveUp = true;
+                    (slot.parallel ? rcStatsParallel : rcStatsSingle).failures++;
+                    slot.code = -1;
+                    continue;
                 }
-                rcNextTry = now + REQUEST_CODE_RETRY;
+
+                if (!make_request_code_msg(slot.code, msg))
+                {
+                    slot.code = -1;
+                    continue;
+                }
+
+                ++slot.tries;
+                rcResults[slot.code].tries = slot.tries;
+                slot.nextTry = now + REQUEST_CODE_RETRY;
                 PendingCmd pending;
                 pending.msg = msg;
                 getQueue.push_front(std::move(pending));
                 send = true;
             }
-            else
-            {
-                rcActive = -1;
-            }
+
+            // Release slot 2 when parallel mode was switched off (a running query may finish)
         }
 
-        if (!send)
-        {
-            if (rcTries >= REQUEST_CODE_MAX_TRIES)
-                log_web(F("Request code query: no valid answer after %u tries (outdoor unit does not support it?)"), (unsigned)REQUEST_CODE_MAX_TRIES);
-            return;
-        }
+        if (failed != -1)
+            log_web(F("Request code %d: no valid answer after %u tries"), (int)failed, (unsigned)REQUEST_CODE_MAX_TRIES);
 
-        dispatch_next_cmd();
+        if (send)
+            dispatch_next_cmd();
+    }
+
+    void set_request_code_parallel(bool on)
+    {
+        rcParallel = on;
+    }
+
+    bool get_request_code_parallel()
+    {
+        return rcParallel;
+    }
+
+    void get_request_code_stats(RcStats& single, RcStats& parallel)
+    {
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+        single = rcStatsSingle;
+        parallel = rcStatsParallel;
+    }
+
+    void reset_request_code_stats()
+    {
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+        rcStatsSingle = RcStats{};
+        rcStatsParallel = RcStats{};
     }
 
     void handle_loop()
@@ -1249,13 +1348,19 @@ namespace ehal::hp
             if (c == code)
                 return true; // already queued
         rcProbeQueue.push_back(code);
+        if (code >= 0 && code <= RC_MAX_CODE)
+            rcResults[code].gaveUp = false;
         return true;
     }
 
     size_t request_code_probe_queue_length()
     {
         std::lock_guard<std::mutex> lock{cmdQueueMutex};
-        return rcProbeQueue.size() + (rcActive != -1 ? 1 : 0);
+        size_t active = 0;
+        for (const auto& slot : rcSlots)
+            if (slot.code != -1)
+                ++active;
+        return rcProbeQueue.size() + active;
     }
 
     bool get_request_code_result(int16_t code, uint8_t raw[16], uint8_t& state, uint8_t& tries, bool& gaveUp, uint32_t& ageMs)

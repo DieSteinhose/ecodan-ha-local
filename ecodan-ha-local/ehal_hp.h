@@ -291,6 +291,20 @@ namespace ehal::hp
     bool queue_request_code_probe(int16_t code);
     size_t request_code_probe_queue_length();
     bool get_request_code_result(int16_t code, uint8_t raw[16], uint8_t& state, uint8_t& tries, bool& gaveUp, uint32_t& ageMs);
+
+    // Timing statistics of request code queries (single vs. parallel mode)
+    struct RcStats
+    {
+        uint32_t count = 0;    // valid responses
+        uint32_t sumMs = 0;    // sum of durations first request -> valid response
+        uint32_t maxMs = 0;
+        uint32_t sumTries = 0;
+        uint32_t failures = 0; // max. attempts without a valid response
+    };
+    void set_request_code_parallel(bool on);
+    bool get_request_code_parallel();
+    void get_request_code_stats(RcStats& single, RcStats& parallel);
+    void reset_request_code_stats();
     uint32_t get_status_cycle_count(); // fully received status cycles since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp

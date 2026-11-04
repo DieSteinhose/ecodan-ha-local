@@ -1,3 +1,4 @@
+#include <initializer_list>
 #include "ehal_config.h"
 #include "ehal_css_gz.h"
 #include "ehal_ota.h"
@@ -394,6 +395,125 @@ namespace ehal::http
         return String(raw);
     }
 
+    // Format a request code value for the web UI ("" = never read)
+    String rc_display(int16_t code, uint32_t& ageS)
+    {
+        uint8_t raw[16];
+        uint8_t state = 0, tries = 0;
+        bool gaveUp = false;
+        uint32_t ageMs = 0;
+        if (!hp::get_request_code_result(code, raw, state, tries, gaveUp, ageMs) || state == 0)
+            return String();
+        ageS = ageMs / 1000;
+        const uint16_t u = uint16_t(raw[4]) | (uint16_t(raw[5]) << 8);
+        const uint8_t d1 = u & 0x0F;         // state (1) = rightmost hex digit
+        const uint8_t d2 = (u >> 4) & 0x0F;  // state (2)
+
+        switch (code)
+        {
+        case 52: // OCH694A 10-1-1: (1) current limit, (2) protection controls (bit mask)
+        {
+            String s;
+            if (d1 & 1) s += F("discharge temp. overheat prev., ");
+            if (d1 & 2) s += F("condensation temp. overheat prev., ");
+            if (d1 & 4) s += F("anti-freeze protection, ");
+            if (d1 & 8) s += F("heat sink overheat prev., ");
+            if (d2 == 1) s += F("primary current limit, ");
+            if (d2 == 2) s += F("secondary current limit, ");
+            if (s.isEmpty()) return F("none");
+            s.remove(s.length() - 2);
+            return s;
+        }
+        case 54:
+        {
+            String s;
+            if (d1 & 1) s += F("SV1, ");
+            if (d1 & 2) s += F("4-way valve, ");
+            if (d1 & 4) s += F("compressor, ");
+            if (d1 & 8) s += F("compressor warming up, ");
+            if (d2 & 1) s += F("52C, ");
+            if (d2 & 2) s += F("SV2, ");
+            if (d2 & 4) s += F("SS, ");
+            if (s.isEmpty()) return F("all off");
+            s.remove(s.length() - 2);
+            return s + F(" ON");
+        }
+        case 51:
+            return u == 0 ? String(F("normal")) : u == 1 ? String(F("preparing heat operation")) : u == 2 ? String(F("defrost")) : String(u, HEX);
+        case 2:
+            return String((unsigned long)u * 10) + F(" h");
+        case 3:
+            return String((unsigned long)u * 100);
+        case 16: case 17:
+            return String(u) + F(" Hz");
+        case 1: case 25:
+            return String(u) + F(" A");
+        case 26:
+            return String(u) + F(" V");
+        case 48:
+            return String(u) + F(" min");
+        case 4: case 5: case 7: case 8: case 9: case 10: case 11:
+            return String((int)(int16_t)u) + F(" &#176;C");
+        case 12: case 13:
+            return String(u) + F(" K");
+        case 22: case 23: case 24:
+            return String(u);
+        case 18:
+            return String(F("step ")) + String(u);
+        case 19:
+            return String(u) + F(" rpm");
+        default:
+            return String(u);
+        }
+    }
+
+    // Several codes in one row, "a / b / c"; age = oldest value
+    String rc_row(const __FlashStringHelper* label, std::initializer_list<int16_t> codes)
+    {
+        String v;
+        uint32_t maxAge = 0;
+        bool any = false;
+        for (int16_t c : codes)
+        {
+            uint32_t age = 0;
+            String part = rc_display(c, age);
+            if (!v.isEmpty())
+                v += F(" / ");
+            if (part.isEmpty())
+            {
+                v += '?';
+                continue;
+            }
+            v += part;
+            any = true;
+            if (age > maxAge)
+                maxAge = age;
+        }
+        if (any)
+            v += String(F(" <small>(")) + String((unsigned long)maxAge) + F(" s)</small>");
+        return String(F("<tr><td>")) + label + F("</td><td>") + v + F("</td></tr>");
+    }
+
+    String outdoor_unit_rows()
+    {
+        String t;
+        t += rc_row(F("Compressor Target / Actual Freq. (17/16):"), {17, 16});
+        t += rc_row(F("Frequency Limitation (52):"), {52});
+        t += rc_row(F("Thermo ON Time (48):"), {48});
+        t += rc_row(F("Discharge Temp. TH4 (4):"), {4});
+        t += rc_row(F("Discharge Superheat / Sub-cool (12/13):"), {12, 13});
+        t += rc_row(F("Compressor / Primary Current (1/25):"), {1, 25});
+        t += rc_row(F("Outdoor Ambient TH7 (9):"), {9});
+        t += rc_row(F("LEV A / B / C Opening (22/23/24):"), {22, 23, 24});
+        t += rc_row(F("Fan Step / Speed (18/19):"), {18, 19});
+        t += rc_row(F("Actuators (54):"), {54});
+        t += rc_row(F("Control State (51):"), {51});
+        t += rc_row(F("Compressor Operating Time / Starts (2/3):"), {2, 3});
+        t += F("<tr><td colspan=\"2\"><small>Live: 17, 16, 52, 48, 4, 1 in rotation (~5-8 s per code); 2, 3 hourly; others on demand: "
+               "<a href=\"/cn105_rc?rc=all\">query all</a> (~6 min) &middot; <a href=\"/cn105_rc\">raw table &amp; statistics</a></small></td></tr>");
+        return t;
+    }
+
     void handle_heat_pump()
     {
         if (show_login_if_required())
@@ -479,6 +599,8 @@ namespace ehal::http
             page.replace(F("{{raw_13}}"), String(F("13: ")) + raw_response_hex(0x13));
             page.replace(F("{{raw_0e}}"), String(F("0E: ")) + raw_response_hex(0x0E));
         }
+
+        page.replace(F("{{outdoor_unit}}"), outdoor_unit_rows()); // r13
 
         server.send(200, F("text/html"), page);
     }
@@ -833,6 +955,29 @@ namespace ehal::http
                 }
                 out += String(F("Queued code ")) + String(code) + F(" - reload this page in a few seconds.\n\n");
             }
+        }
+
+        if (server.hasArg(F("parallel")))
+            hp::set_request_code_parallel(server.arg(F("parallel")) == F("1"));
+        if (server.hasArg(F("resetstats")))
+            hp::reset_request_code_stats();
+
+        {
+            hp::RcStats single, parallel;
+            hp::get_request_code_stats(single, parallel);
+            auto line = [&](const __FlashStringHelper* label, const hp::RcStats& st) {
+                char buf[160];
+                snprintf(buf, sizeof(buf), "%-9s n=%-4lu avg=%5lu ms  max=%5lu ms  avg tries=%.1f  failures=%lu\n",
+                         (const char*)label, (unsigned long)st.count,
+                         (unsigned long)(st.count ? st.sumMs / st.count : 0), (unsigned long)st.maxMs,
+                         st.count ? double(st.sumTries) / st.count : 0.0, (unsigned long)st.failures);
+                out += buf;
+            };
+            out += String(F("Mode: ")) + (hp::get_request_code_parallel() ? F("PARALLEL (2 codes alternating)") : F("single")) +
+                   F("   [?parallel=1 | ?parallel=0 | ?resetstats=1]\n");
+            line(F("single"), single);
+            line(F("parallel"), parallel);
+            out += '\n';
         }
 
         out += String(F("Pending: ")) + String((unsigned)hp::request_code_probe_queue_length()) + F("\n");
