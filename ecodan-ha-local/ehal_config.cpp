@@ -90,9 +90,9 @@ namespace ehal
     String get_software_version()
     {
 #ifdef EHAL_VERSION_SUFFIX
-        return String(F("v0.2.3-thw10-r15")) + F(EHAL_VERSION_SUFFIX);
+        return String(F("v0.2.3-thw10-r16")) + F(EHAL_VERSION_SUFFIX);
 #else
-        return FPSTR("v0.2.3-thw10-r15");
+        return FPSTR("v0.2.3-thw10-r16");
 #endif
     }
 

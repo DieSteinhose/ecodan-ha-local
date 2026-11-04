@@ -1616,9 +1616,9 @@ off
                 return;
             if (fresh(1, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("compressor_current"), float(v)))
                 return;
-            if (fresh(12, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("discharge_superheat"), float(v)))
+            if (fresh(12, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("discharge_superheat"), float(int16_t(v))))
                 return;
-            if (fresh(13, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("subcool"), float(v)))
+            if (fresh(13, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("subcool"), float(int16_t(v))))
                 return;
             if (fresh(9, RC_MAX_AGE_SLOW_S) && !publish_sensor_status<float>(F("outdoor_ambient_temp"), float(int16_t(v))))
                 return;

@@ -175,3 +175,201 @@ namespace ehal
 #endif
     }
 } // namespace ehal
+// ---------------------------------------------------------------------------------------------
+// WiFi/reset diagnostics
+// ---------------------------------------------------------------------------------------------
+#include <WiFi.h>
+#include <esp_attr.h>
+#include <esp_system.h>
+
+namespace ehal
+{
+    namespace
+    {
+        const uint32_t NETDIAG_MAGIC = 0xEC0DA116;
+
+        struct RtcNetDiag
+        {
+            uint32_t magic;
+            uint32_t uptimeS;        // last recorded uptime
+            uint32_t disconnects;    // WiFi disconnects during this boot
+            uint16_t lastReason;     // last disconnect reason (wifi_err_reason_t)
+            uint8_t wifiReboot;      // 1 = restarted by the WiFi watchdog
+            uint8_t pad;
+        };
+
+        RTC_NOINIT_ATTR RtcNetDiag rtcNet;
+        RtcNetDiag prevBoot{};
+        bool prevValid = false;
+        esp_reset_reason_t resetReason = ESP_RST_UNKNOWN;
+
+        volatile uint32_t wifiDisconnects = 0;
+        volatile uint16_t wifiLastReason = 0;
+        volatile uint32_t wifiLastDisconnectMs = 0;
+        volatile uint32_t wifiLastConnectMs = 0;
+        volatile bool wifiEventPending = false;
+
+        const char* reset_reason_name(esp_reset_reason_t r)
+        {
+            switch (r)
+            {
+            case ESP_RST_POWERON: return "power-on";
+            case ESP_RST_EXT: return "external pin";
+            case ESP_RST_SW: return "software restart";
+            case ESP_RST_PANIC: return "PANIC (crash)";
+            case ESP_RST_INT_WDT: return "interrupt watchdog";
+            case ESP_RST_TASK_WDT: return "task watchdog";
+            case ESP_RST_WDT: return "other watchdog";
+            case ESP_RST_DEEPSLEEP: return "deep sleep";
+            case ESP_RST_BROWNOUT: return "BROWNOUT (supply voltage)";
+            case ESP_RST_USB: return "USB";
+            case ESP_RST_PWR_GLITCH: return "power glitch";
+            case ESP_RST_CPU_LOCKUP: return "CPU lockup";
+            default: return "unknown";
+            }
+        }
+
+        String duration_text(uint32_t s)
+        {
+            char b[32];
+            if (s >= 86400)
+                snprintf(b, sizeof(b), "%lud %luh", (unsigned long)(s / 86400), (unsigned long)((s % 86400) / 3600));
+            else if (s >= 3600)
+                snprintf(b, sizeof(b), "%luh %lumin", (unsigned long)(s / 3600), (unsigned long)((s % 3600) / 60));
+            else
+                snprintf(b, sizeof(b), "%lumin %lus", (unsigned long)(s / 60), (unsigned long)(s % 60));
+            return String(b);
+        }
+
+        String reason_text(uint16_t reason)
+        {
+            String s = String(reason);
+            if (reason != 0)
+            {
+                s += F(" (");
+                s += WiFi.STA.disconnectReasonName((wifi_err_reason_t)reason);
+                s += F(")");
+            }
+            return s;
+        }
+    } // namespace
+
+    void netdiag_init()
+    {
+        resetReason = esp_reset_reason();
+
+        // RTC RAM survives software reset/panic/watchdog, but not power-on/brownout.
+        if (rtcNet.magic == NETDIAG_MAGIC && resetReason != ESP_RST_POWERON && resetReason != ESP_RST_BROWNOUT)
+        {
+            prevBoot = rtcNet;
+            prevValid = true;
+        }
+
+        rtcNet = RtcNetDiag{};
+        rtcNet.magic = NETDIAG_MAGIC;
+
+        WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+            if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+            {
+                uint16_t reason = info.wifi_sta_disconnected.reason;
+                // Only count the connected -> disconnected transition (not failed reconnects).
+                if (wifiLastConnectMs != 0)
+                {
+                    ++wifiDisconnects;
+                    wifiLastDisconnectMs = millis();
+                }
+                else if (wifiLastDisconnectMs == 0)
+                {
+                    wifiLastDisconnectMs = millis(); // first connection attempt at boot
+                }
+                // ASSOC_LEAVE (8) is caused by our own disconnect() during reconnect -> keep the original reason
+                if (reason != WIFI_REASON_ASSOC_LEAVE || wifiLastReason == 0)
+                    wifiLastReason = reason;
+                wifiLastConnectMs = 0;
+                wifiEventPending = true;
+            }
+            else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP)
+            {
+                wifiLastConnectMs = millis();
+                wifiEventPending = true;
+            }
+        });
+    }
+
+    void netdiag_loop()
+    {
+        static uint32_t lastUpdate = 0;
+        static bool loggedBoot = false;
+        static bool wasConnected = false;
+        uint32_t nowMs = millis();
+
+        if (!loggedBoot)
+        {
+            loggedBoot = true;
+            log_web(F("Reset reason: %s"), reset_diag_text().c_str());
+        }
+
+        if (wifiEventPending)
+        {
+            wifiEventPending = false;
+            bool connected = wifiLastConnectMs != 0;
+            if (connected && !wasConnected && wifiLastDisconnectMs != 0)
+                log_web(F("WiFi reconnected after %lu s (last disconnect reason %s)"),
+                        (unsigned long)((wifiLastConnectMs - wifiLastDisconnectMs) / 1000), reason_text(wifiLastReason).c_str());
+            else if (!connected && wasConnected)
+                log_web(F("WiFi disconnected, reason %s"), reason_text(wifiLastReason).c_str());
+            wasConnected = connected;
+        }
+
+        if (nowMs - lastUpdate >= 1000)
+        {
+            lastUpdate = nowMs;
+            rtcNet.uptimeS = nowMs / 1000;
+            rtcNet.disconnects = wifiDisconnects;
+            rtcNet.lastReason = wifiLastReason;
+        }
+    }
+
+    void netdiag_note_wifi_reboot()
+    {
+        rtcNet.uptimeS = millis() / 1000;
+        rtcNet.disconnects = wifiDisconnects;
+        rtcNet.lastReason = wifiLastReason;
+        rtcNet.wifiReboot = 1;
+    }
+
+    String reset_diag_text()
+    {
+        String s = reset_reason_name(resetReason);
+        if (prevValid)
+        {
+            if (prevBoot.wifiReboot)
+                s += F(" - WiFi watchdog restart");
+            s += F("; previous run: ");
+            s += duration_text(prevBoot.uptimeS);
+            s += F(", ");
+            s += String(prevBoot.disconnects);
+            s += F(" WiFi disconnects, last reason ");
+            s += reason_text(prevBoot.lastReason);
+        }
+        return s;
+    }
+
+    String wifi_diag_text()
+    {
+        String s = String((unsigned long)wifiDisconnects);
+        s += F(" disconnects since boot");
+        if (wifiLastReason != 0)
+        {
+            s += F(", last reason ");
+            s += reason_text(wifiLastReason);
+            if (wifiLastDisconnectMs != 0)
+            {
+                s += F(", ");
+                s += duration_text((millis() - wifiLastDisconnectMs) / 1000);
+                s += F(" ago");
+            }
+        }
+        return s;
+    }
+} // namespace ehal

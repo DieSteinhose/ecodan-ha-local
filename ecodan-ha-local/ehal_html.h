@@ -244,6 +244,14 @@ namespace ehal
         <td>{{device_boot_time}}</td>
     </tr>
     <tr>
+        <td>Last Reset Reason:</td>
+        <td>{{reset_reason}}</td>
+    </tr>
+    <tr>
+        <td>WiFi Disconnects:</td>
+        <td>{{wifi_diag}}</td>
+    </tr>
+    <tr>
         <td>HomeAssistant Heat Pump Zone 1 Entity:</td>
         <td>{{ha_hp_entity}}</td>
     </tr>

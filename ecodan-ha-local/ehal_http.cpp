@@ -366,6 +366,8 @@ namespace ehal::http
         page.replace(F("{{wifi_mac}}"), WiFi.macAddress());
         page.replace(F("{{wifi_rssi}}"), String(WiFi.RSSI()));
         page.replace(F("{{device_boot_time}}"), ehal::config_instance().BootTime);
+        page.replace(F("{{reset_reason}}"), reset_diag_text());
+        page.replace(F("{{wifi_diag}}"), wifi_diag_text());
 
         page.replace(F("{{ha_hp_entity}}"), String(F("climate.")) + ehal::mqtt::unique_entity_name(F("climate_control")));
         page.replace(F("{{ha_hp_z2_entity}}"), String(F("climate.")) + ehal::mqtt::unique_entity_name(F("climate_control_z2")));
@@ -431,7 +433,7 @@ namespace ehal::http
         case 4: case 5: case 7: case 8: case 9: case 10: case 11:
             return String((int)(int16_t)u) + F(" &#176;C");
         case 12: case 13:
-            return String(u) + F(" K");
+            return String((int)(int16_t)u) + F(" K");
         case 22: case 23: case 24:
             return String(u);
         case 18:

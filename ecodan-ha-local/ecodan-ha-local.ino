@@ -23,13 +23,20 @@ const uint8_t ledTickPatternHpDisconnect[] = { HIGH, LOW, HIGH, LOW, HIGH, HIGH,
 const uint8_t ledTickPatternMqttDisconnect[] = { HIGH, HIGH, HIGH, LOW, LOW, LOW };
 const uint8_t ledTickPatternWiFiDisconnected[] = { HIGH, LOW };
 std::chrono::steady_clock::time_point wifiDisconnectDetected = std::chrono::steady_clock::time_point::min();
-const auto maxWifiDisconnectLength = std::chrono::minutes{10}; // If the WiFi is disconnected for this length of time, reboot and try to re-initialize.
+const auto maxWifiDisconnectLength = std::chrono::minutes{10}; // at boot: wait this long for the first WiFi connection (router restart after a power cut).
+// While running, reboot after 5 min without WiFi. Trigger a reconnect at most every 30 s -
+// previously WiFi.reconnect() was called in EVERY loop(), which kept aborting the ongoing connection
+// attempt, so the bridge did not come back after a short WiFi dropout.
+const auto maxWifiOutageRuntime = std::chrono::minutes{5};
+const auto wifiReconnectInterval = std::chrono::seconds{30};
 
 bool initialize_wifi_access_point()
 {
     ehal::log_web(F("Initializing WiFi connection..."));
 
     ehal::Config& config = ehal::config_instance();
+
+    ehal::netdiag_init(); // register event handlers before WiFi.begin()
 
     if (!ehal::requires_first_time_configuration())
     {
@@ -41,6 +48,7 @@ bool initialize_wifi_access_point()
             }
         }
         WiFi.begin(config.WifiSsid.c_str(), config.WifiPassword.c_str());
+        WiFi.setSleep(false); // no modem sleep -> no beacon timeouts with weak signal
 
         // Give us 10 mins to re-establish a WiFi connection before we give up,
         // just in case there's a power cut and the router needs time to boot.
@@ -185,32 +193,37 @@ void log_last_reset_reason()
 
 void reboot_if_wifi_disconnected_too_long()
 {
+    static auto lastReconnectAttempt = std::chrono::steady_clock::time_point::min();
+    auto now = std::chrono::steady_clock::now();
+
     if (!WiFi.isConnected())
     {
-        if (wifiDisconnectDetected != std::chrono::steady_clock::time_point::min())
+        if (wifiDisconnectDetected == std::chrono::steady_clock::time_point::min())
         {
-            if (!WiFi.reconnect())
-            {
-                // If it's been more than maxWifiDisconnectLength since we had a WiFi connection, restart.
-                if ((std::chrono::steady_clock::now() - wifiDisconnectDetected) > maxWifiDisconnectLength)
-                    ESP.restart();
-            }
-            else
-            {
-                ehal::log_web(F("WiFi disconnected, but reconnection was successful!"));
-            }
+            // First detection: the core attempts an auto-reconnect itself, so wait first.
+            wifiDisconnectDetected = now;
+            lastReconnectAttempt = now;
+            ehal::log_web(F("WiFi disconnection detected... allowing up to %llu minutes to recover..."), maxWifiOutageRuntime.count());
+            return;
         }
-        else
+
+        if (now - wifiDisconnectDetected > maxWifiOutageRuntime)
         {
-            // This is the first we've seen of the disconnect, set off our timer.
-            wifiDisconnectDetected = std::chrono::steady_clock::now();
-            ehal::log_web(F("WiFi disconnection detected... allowing up to %llu minutes to recover..."), maxWifiDisconnectLength.count());
+            ehal::log_web(F("WiFi down for more than %llu minutes, restarting..."), maxWifiOutageRuntime.count());
+            ehal::netdiag_note_wifi_reboot();
+            delay(200);
+            ESP.restart();
+        }
+
+        if (now - lastReconnectAttempt >= wifiReconnectInterval)
+        {
+            lastReconnectAttempt = now;
+            WiFi.reconnect();
         }
     }
     else if (wifiDisconnectDetected != std::chrono::steady_clock::time_point::min())
     {
-        // If we recovered the connection automatically, reset our disconnect timer.
-        auto disconnectLength = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wifiDisconnectDetected).count();
+        auto disconnectLength = std::chrono::duration_cast<std::chrono::seconds>(now - wifiDisconnectDetected).count();
         ehal::log_web(F("WiFi connection re-established after (%llu) seconds."), disconnectLength);
         wifiDisconnectDetected = std::chrono::steady_clock::time_point::min();
     }
@@ -272,6 +285,7 @@ void loop()
         update_status_led();
 
         reboot_if_wifi_disconnected_too_long();
+        ehal::netdiag_loop();
 
         ehal::ota::handle_loop();
     }
