@@ -59,7 +59,7 @@ namespace ehal::hp
     std::deque<int16_t> rcProbeQueue;
     // Retry interval 1 s like gekkekoe (measured: the outdoor unit answers after 5-8 s, time-based).
     const auto REQUEST_CODE_RETRY = std::chrono::milliseconds(1000);
-    const uint8_t REQUEST_CODE_MAX_TRIES = 12;
+    const uint8_t REQUEST_CODE_MAX_TRIES = 15; // single mode: max. measured 10.4 s; with 12 there were ~6 % failures
     const auto REQUEST_CODE_START_DELAY = std::chrono::seconds(30);
 
     // Query slots. Normally 1 slot; in the parallel test 2 slots (alternating A, B, A, B ...).
@@ -858,9 +858,12 @@ namespace ehal::hp
 
                 std::lock_guard<std::mutex> rcLock{cmdQueueMutex}; // lock order status -> cmdQueue (never the other way round)
                 RcResult& r = rcResults[code];
-                // Byte 3 = DISPLAY FORMAT (1 hex/code, 2 decimal, 3 error code, 4 operation mode, 6 n/a); 0 = not ready yet.
-                // An intermediate format-0 reply never overwrites a valid old value.
-                if (state != 0 || r.when == 0 || r.state == 0)
+                // Byte 3 = DISPLAY FORMAT (1 hex/code, 2 decimal, 3 error code, 4 operation mode); 0 = not ready yet;
+                // 6 = currently NOT AVAILABLE (value 0) - e.g. codes 2/3 shortly after boot, fan 2 permanently.
+                // Format 0/6 never overwrites a valid old value.
+                const bool usable = (state != 0 && state != 6);
+                const bool haveUsable = (r.when != 0 && r.state != 0 && r.state != 6);
+                if (usable || !haveUsable)
                 {
                     memcpy(r.raw, res.payload(), PAYLOAD_SIZE);
                     r.state = state;
@@ -870,6 +873,18 @@ namespace ehal::hp
 
                 if (state == 0)
                     break; // handle_request_codes() retries
+
+                if (state == 6)
+                {
+                    // not available: end the slot (no success), retry interval code in the next round
+                    for (auto& slot : rcSlots)
+                        if (slot.code == code)
+                            slot.code = -1;
+                    for (auto& p : rcPoll)
+                        if (p.code == code)
+                            p.everRun = false;
+                    break;
+                }
 
                 for (auto& slot : rcSlots)
                 {
@@ -1150,6 +1165,7 @@ namespace ehal::hp
                     break;
                 slot.code = c;
                 slot.tries = 0;
+                slot.parallel = false; // the flag only applies to this query
                 slot.startMs = millis();
                 // in parallel mode offset the second slot by half a period -> A, B, A, B ...
                 slot.nextTry = now + ((i == 1) ? REQUEST_CODE_RETRY / 2 : std::chrono::milliseconds(0));

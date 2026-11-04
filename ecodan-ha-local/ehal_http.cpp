@@ -957,8 +957,10 @@ namespace ehal::http
             }
         }
 
+        // Parallel test finished: the FTC only fetches ONE code at a time; switching codes restarts the
+        // query (5 min: 3 valid, 46 failures). Switch disabled, single mode only.
         if (server.hasArg(F("parallel")))
-            hp::set_request_code_parallel(server.arg(F("parallel")) == F("1"));
+            hp::set_request_code_parallel(false);
         if (server.hasArg(F("resetstats")))
             hp::reset_request_code_stats();
 
@@ -974,7 +976,7 @@ namespace ehal::http
                 out += buf;
             };
             out += String(F("Mode: ")) + (hp::get_request_code_parallel() ? F("PARALLEL (2 codes alternating)") : F("single")) +
-                   F("   [?parallel=1 | ?parallel=0 | ?resetstats=1]\n");
+                   F("   [?resetstats=1]  (parallel mode disabled: FTC fetches one code at a time)\n");
             line(F("single"), single);
             line(F("parallel"), parallel);
             out += '\n';
