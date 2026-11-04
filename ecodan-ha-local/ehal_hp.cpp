@@ -838,7 +838,10 @@ namespace ehal::hp
                 }
                 if (code != rcActive || !is_request_code_whitelisted(code))
                     break; // no query or a different query active
-                if (state == 1 || state == 2)
+                // Byte 3 is the DISPLAY FORMAT (observed: 1 = hex/code, 2 = decimal, 3 = error code,
+                // 4 = operation mode display, 6 = n/a). Only 0 = "outdoor unit not ready yet".
+                // (gekkekoe only accepts 1/2 -> codes with format 3/4/6 were retried 10x.)
+                if (state != 0)
                 {
                     const uint16_t value = uint16_t(res[4]) | (uint16_t(res[5]) << 8); // Little-Endian
                     if (code == 3)

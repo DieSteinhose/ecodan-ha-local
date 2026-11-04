@@ -836,8 +836,9 @@ namespace ehal::http
         }
 
         out += String(F("Pending: ")) + String((unsigned)hp::request_code_probe_queue_length()) + F("\n");
-        out += F("Value = bytes 4..5 little-endian (u16 / s16). State 1/2 = valid, 0 = outdoor unit not ready.\n\n");
-        out += F("Code  Description                              State  u16    s16    hex   Age    Raw\n");
+        out += F("Value = bytes 4..5 little-endian (u16 / s16 / hex). Fmt = byte 3: 0 = not ready, 1 = hex/code (read hex column),\n"
+                 "2 = decimal, 3 = error code, 4 = operation-mode display, 6 = n/a. Status codes 51-55: hex digits per OCH694A 10-1-1.\n\n");
+        out += F("Code  Description                              Fmt    u16    s16    hex   Age    Raw\n");
 
         const int16_t* codes = nullptr;
         size_t n = hp::readable_request_codes(codes);
