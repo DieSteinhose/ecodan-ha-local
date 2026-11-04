@@ -36,14 +36,37 @@ namespace ehal::hp
     // 340-363 = counter reset/forced operation!) is unknown -> no code outside this
     // list may ever be sent. A 0xA3 message is only ever created in make_request_code_msg().
     // ---------------------------------------------------------------------------------
+    // Periodically queried codes (subset of RC_READ_CODES).
     const int16_t REQUEST_CODE_WHITELIST[] = {
         3, // Compressor-Number of operation times, 0..9999, unit 100 starts
     };
+
+    // ALL codes documented in OCH694A table 10-1 (PUD-SWM/SHWM, R32) - read-only codes according to the manual.
+    // Only these may ever be sent (periodically or via diagnostics /cn105_rc).
+    const int16_t RC_READ_CODES[] = {
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 48,
+        51, 52, 53, 54, 55, 70, 71, 90, 91,
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116, 117, 118, 119,
+        120, 121, 122, 123, 125, 126, 127, 130, 132, 133, 135,
+    };
+    const int16_t RC_MAX_CODE = 135;
+
+    // Results per code (diagnostics)
+    struct RcResult
+    {
+        uint8_t raw[PAYLOAD_SIZE];
+        uint8_t state = 0;     // byte 3 of the response (1/2 = valid)
+        uint8_t tries = 0;
+        uint32_t when = 0;     // millis() of the last response, 0 = never
+        bool gaveUp = false;   // max. attempts reached without a valid response
+    };
+    RcResult rcResults[RC_MAX_CODE + 1];
+    std::deque<int16_t> rcProbeQueue;
     const auto REQUEST_CODE_INTERVAL = std::chrono::minutes(10);
     const auto REQUEST_CODE_RETRY = std::chrono::milliseconds(1500);
     const uint8_t REQUEST_CODE_MAX_TRIES = 10;
 
-    std::atomic<int16_t> rcActive{0}; // 0 = no query active (code 0 is never whitelisted); also read by the RX thread
+    std::atomic<int16_t> rcActive{-1}; // -1 = no query active (code 0 is a valid code!); also read by the RX thread
     uint8_t rcTries = 0;
     std::chrono::steady_clock::time_point rcNextTry;
     std::chrono::steady_clock::time_point rcLastCycle;
@@ -51,7 +74,7 @@ namespace ehal::hp
 
     bool is_request_code_whitelisted(int16_t code)
     {
-        for (int16_t allowed : REQUEST_CODE_WHITELIST)
+        for (int16_t allowed : RC_READ_CODES)
             if (allowed == code)
                 return true;
         return false;
@@ -804,6 +827,15 @@ namespace ehal::hp
             {
                 const int16_t code = static_cast<int16_t>((uint16_t(res[1]) << 8) | res[2]);
                 const uint8_t state = res[3];
+                if (is_request_code_whitelisted(code) && code >= 0 && code <= RC_MAX_CODE)
+                {
+                    std::lock_guard<std::mutex> rcLock{cmdQueueMutex}; // lock order status -> cmdQueue (never the other way round)
+                    RcResult& r = rcResults[code];
+                    memcpy(r.raw, res.payload(), PAYLOAD_SIZE);
+                    r.state = state;
+                    uint32_t now = millis();
+                    r.when = now == 0 ? 1 : now;
+                }
                 if (code != rcActive || !is_request_code_whitelisted(code))
                     break; // no query or a different query active
                 if (state == 1 || state == 2)
@@ -814,7 +846,7 @@ namespace ehal::hp
                         status.CompressorStarts = uint32_t(value) * 100;
                         status.CompressorStartsValid = true;
                     }
-                    rcActive = 0;
+                    rcActive = -1;
                 }
                 // state 0: outdoor unit has not answered yet -> handle_loop retries
                 break;
@@ -1018,7 +1050,21 @@ namespace ehal::hp
         {
             std::lock_guard<std::mutex> lock{cmdQueueMutex};
 
-            if (rcActive == 0)
+            if (rcActive == -1 && !rcProbeQueue.empty())
+            {
+                // Diagnostic queries take priority (up to 10 attempts per code)
+                rcActive = rcProbeQueue.front();
+                rcProbeQueue.pop_front();
+                rcTries = 0;
+                rcNextTry = now;
+                if (rcActive >= 0 && rcActive <= RC_MAX_CODE)
+                {
+                    rcResults[rcActive].gaveUp = false;
+                    rcResults[rcActive].tries = 0;
+                }
+            }
+
+            if (rcActive == -1)
             {
                 // First query 30 s after connecting, then every 10 min.
                 if (!rcEverStarted)
@@ -1040,11 +1086,19 @@ namespace ehal::hp
             if (rcTries >= REQUEST_CODE_MAX_TRIES)
             {
                 // Lock is released below, log afterwards.
-                rcActive = 0;
+                int16_t c = rcActive;
+                if (c >= 0 && c <= RC_MAX_CODE)
+                    rcResults[c].gaveUp = true;
+                rcActive = -1;
             }
             else if (make_request_code_msg(rcActive, msg))
             {
                 ++rcTries;
+                {
+                    int16_t c = rcActive;
+                    if (c >= 0 && c <= RC_MAX_CODE)
+                        rcResults[c].tries = rcTries;
+                }
                 rcNextTry = now + REQUEST_CODE_RETRY;
                 PendingCmd pending;
                 pending.msg = msg;
@@ -1053,7 +1107,7 @@ namespace ehal::hp
             }
             else
             {
-                rcActive = 0;
+                rcActive = -1;
             }
         }
 
@@ -1169,6 +1223,52 @@ namespace ehal::hp
                 s += ' ';
         }
         return s;
+    }
+
+    // Diagnostics for outdoor unit request codes
+    bool is_readable_request_code(int16_t code)
+    {
+        return is_request_code_whitelisted(code);
+    }
+
+    size_t readable_request_codes(const int16_t*& codes)
+    {
+        codes = RC_READ_CODES;
+        return sizeof(RC_READ_CODES) / sizeof(RC_READ_CODES[0]);
+    }
+
+    bool queue_request_code_probe(int16_t code)
+    {
+        if (!is_request_code_whitelisted(code) || !connected)
+            return false;
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+        for (int16_t c : rcProbeQueue)
+            if (c == code)
+                return true; // already queued
+        rcProbeQueue.push_back(code);
+        return true;
+    }
+
+    size_t request_code_probe_queue_length()
+    {
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+        return rcProbeQueue.size() + (rcActive != -1 ? 1 : 0);
+    }
+
+    bool get_request_code_result(int16_t code, uint8_t raw[16], uint8_t& state, uint8_t& tries, bool& gaveUp, uint32_t& ageMs)
+    {
+        if (code < 0 || code > RC_MAX_CODE)
+            return false;
+        std::lock_guard<std::mutex> lock{cmdQueueMutex};
+        const RcResult& r = rcResults[code];
+        tries = r.tries;
+        gaveUp = r.gaveUp;
+        state = r.state;
+        if (r.when == 0)
+            return false;
+        memcpy(raw, r.raw, PAYLOAD_SIZE);
+        ageMs = millis() - r.when;
+        return true;
     }
 
     bool is_probe_type_allowed(uint8_t type)

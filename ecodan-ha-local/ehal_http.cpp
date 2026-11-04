@@ -717,6 +717,162 @@ namespace ehal::http
         server.send(200, F("text/plain"), out);
     }
 
+    // Outdoor unit request codes (OCH694A table 10-1). GET /cn105_rc        -> result table
+    //                                                  GET /cn105_rc?rc=24  -> queue code 24
+    //                                                  GET /cn105_rc?rc=all -> all documented codes
+    struct RcName
+    {
+        int16_t code;
+        const char* name;
+    };
+    static const RcName RC_NAMES[] = {
+        {0, "Operation state"},
+        {1, "Compressor operating current [A]"},
+        {2, "Compressor accumulated op. time [10 h]"},
+        {3, "Compressor number of operations [100]"},
+        {4, "Discharge temp. TH4 [C]"},
+        {5, "Liquid pipe 1 temp. TH3 [C]"},
+        {7, "2-phase pipe temp. TH6 [C]"},
+        {8, "Suction pipe temp. TH32 [C]"},
+        {9, "Ambient temp. TH7 [C]"},
+        {10, "Heat sink temp. TH8 [C]"},
+        {11, "Comp. surface temp. TH33 [C]"},
+        {12, "Discharge superheat SHd [C]"},
+        {13, "Sub-cool SC [C]"},
+        {16, "Compressor operating freq. [Hz]"},
+        {17, "Compressor target freq. [Hz]"},
+        {18, "Fan output step"},
+        {19, "Fan 1 speed [rpm]"},
+        {20, "Fan 2 speed [rpm]"},
+        {22, "LEV (A) opening [pulses]"},
+        {23, "LEV (B) opening [pulses]"},
+        {24, "LEV (C) opening [pulses] (SHWM only)"},
+        {25, "Primary current [A]"},
+        {26, "DC bus voltage [V]"},
+        {48, "Thermostat ON operating time [min]"},
+        {51, "Outdoor unit control state"},
+        {52, "Compressor frequency control state"},
+        {53, "Fan control state"},
+        {54, "Actuator output state"},
+        {55, "Error content (U9)"},
+        {70, "Capacity setting display"},
+        {71, "Setting information"},
+        {90, "Microprocessor version"},
+        {91, "Microprocessor version (sub No.)"},
+        {100, "Error postponement history 1"},
+        {101, "Error postponement history 2"},
+        {102, "Error postponement history 3"},
+        {103, "Error history 1 (latest)"},
+        {104, "Error history 2"},
+        {105, "Error history 3"},
+        {106, "Abnormal thermistor"},
+        {107, "Last error: operation mode"},
+        {108, "Last error: comp. current [A]"},
+        {109, "Last error: comp. op. time [10 h]"},
+        {110, "Last error: comp. operations [100]"},
+        {111, "Last error: discharge temp. [C]"},
+        {112, "Last error: TH3 [C]"},
+        {114, "Last error: TH6 [C]"},
+        {115, "Last error: TH32 [C]"},
+        {116, "Last error: TH7 [C]"},
+        {117, "Last error: TH8 [C]"},
+        {118, "Last error: SHd [C]"},
+        {119, "Last error: SC [C]"},
+        {120, "Last error: comp. freq. [Hz]"},
+        {121, "Last error: fan step"},
+        {122, "Last error: fan 1 speed [rpm]"},
+        {123, "Last error: fan 2 speed [rpm]"},
+        {125, "Last error: LEV (A)"},
+        {126, "Last error: LEV (B)"},
+        {127, "Last error: LEV (C)"},
+        {130, "Thermo ON time until error stop [min]"},
+        {132, "Last error: indoor TH2 [C]"},
+        {133, "Last error: indoor TH5 [C]"},
+        {135, "Error content (U9) at last time"},
+    };
+
+    const char* rc_name(int16_t code)
+    {
+        for (const auto& n : RC_NAMES)
+            if (n.code == code)
+                return n.name;
+        return "?";
+    }
+
+    void handle_cn105_rc()
+    {
+        if (show_login_if_required())
+            return;
+
+        String out;
+        if (server.hasArg(F("rc")))
+        {
+            String arg = server.arg(F("rc"));
+            if (arg == F("all"))
+            {
+                const int16_t* codes = nullptr;
+                size_t n = hp::readable_request_codes(codes);
+                size_t queued = 0;
+                for (size_t i = 0; i < n; ++i)
+                    if (hp::queue_request_code_probe(codes[i]))
+                        ++queued;
+                out += String(F("Queued ")) + String((unsigned)queued) + F(" codes. Each takes up to ~15 s - reload this page later.\n\n");
+            }
+            else
+            {
+                long code = strtol(arg.c_str(), nullptr, 0);
+                if (!hp::is_readable_request_code(static_cast<int16_t>(code)))
+                {
+                    server.send(400, F("text/plain"), F("code not allowed (only read codes documented in OCH694A table 10-1)"));
+                    return;
+                }
+                if (!hp::queue_request_code_probe(static_cast<int16_t>(code)))
+                {
+                    server.send(503, F("text/plain"), F("heat pump not connected"));
+                    return;
+                }
+                out += String(F("Queued code ")) + String(code) + F(" - reload this page in a few seconds.\n\n");
+            }
+        }
+
+        out += String(F("Pending: ")) + String((unsigned)hp::request_code_probe_queue_length()) + F("\n");
+        out += F("Value = bytes 4..5 little-endian (u16 / s16). State 1/2 = valid, 0 = outdoor unit not ready.\n\n");
+        out += F("Code  Description                              State  u16    s16    hex   Age    Raw\n");
+
+        const int16_t* codes = nullptr;
+        size_t n = hp::readable_request_codes(codes);
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint8_t raw[16];
+            uint8_t state = 0, tries = 0;
+            bool gaveUp = false;
+            uint32_t age = 0;
+            bool have = hp::get_request_code_result(codes[i], raw, state, tries, gaveUp, age);
+            if (!have && !gaveUp && tries == 0)
+                continue; // never queried
+
+            char line[200];
+            if (!have)
+            {
+                snprintf(line, sizeof(line), "%4d  %-40.40s  no answer (%u tries)\n", codes[i], rc_name(codes[i]), (unsigned)tries);
+            }
+            else
+            {
+                uint16_t u = uint16_t(raw[4]) | (uint16_t(raw[5]) << 8);
+                char rawHex[16 * 3];
+                for (size_t b = 0; b < 16; ++b)
+                    snprintf(rawHex + b * 3, 4, b < 15 ? "%02X " : "%02X", raw[b]);
+                snprintf(line, sizeof(line), "%4d  %-40.40s  %u%s  %-5u  %-5d  %04X  %4lus  %s\n",
+                         codes[i], rc_name(codes[i]), (unsigned)state, gaveUp ? "!" : " ", (unsigned)u, (int)(int16_t)u, (unsigned)u,
+                         (unsigned long)(age / 1000), rawHex);
+            }
+            out += line;
+            ehal::ping_watchdog();
+        }
+
+        server.send(200, F("text/plain"), out);
+    }
+
     void handle_milligram_css()
     {
         // gzip-compressed from flash (10 KB -> 2.4 KB), no heap copy; browsers may cache it for 1 day.
@@ -739,6 +895,7 @@ namespace ehal::http
         server.on(F("/update"), HTTP_POST, handle_firmware_update, handle_firmware_update_handler);
         server.on(F("/firmware_rollback"), HTTP_POST, handle_firmware_rollback);
         server.on(F("/cn105_probe"), HTTP_GET, handle_cn105_probe);
+        server.on(F("/cn105_rc"), HTTP_GET, handle_cn105_rc);
 
         // XMLHTTPRequest / Javascript / CSS
         server.on(F("/query_ssid"), handle_query_ssid_list);

@@ -284,6 +284,13 @@ namespace ehal::hp
     bool is_probe_type_allowed(uint8_t type);
     bool request_probe(uint8_t type);
     bool get_last_response(uint8_t type, uint8_t out[16], uint32_t& ageMs);
+
+    // Outdoor unit request codes (only read codes documented in OCH694A)
+    bool is_readable_request_code(int16_t code);
+    size_t readable_request_codes(const int16_t*& codes);
+    bool queue_request_code_probe(int16_t code);
+    size_t request_code_probe_queue_length();
+    bool get_request_code_result(int16_t code, uint8_t raw[16], uint8_t& state, uint8_t& tries, bool& gaveUp, uint32_t& ageMs);
     uint32_t get_status_cycle_count(); // fully received status cycles since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp
