@@ -47,7 +47,8 @@ namespace ehal::mqtt
     // All values every 2 min (robust against briefly lost messages / connection drops).
     const auto FULL_STATE_REFRESH_INTERVAL = std::chrono::seconds(120);
     static_assert(120 + 10 < SENSOR_STATE_TIMEOUT, "full refresh (+tick) must happen before exp_aft");
-    const auto STATE_PUBLISH_INTERVAL = std::chrono::seconds(10);
+    // 5 s (THW6/frequency now arrive every 20 s; delta publishing only sends changes)
+    const auto STATE_PUBLISH_INTERVAL = std::chrono::seconds(5);
     const auto MQTT_RECONNECT_INTERVAL = std::chrono::seconds(30);
     // Max. age of outdoor unit values that are still sent (rotation: fast ~30 s, slow 5 min, hourly)
     const uint32_t RC_MAX_AGE_FAST_S = 120;
@@ -1298,6 +1299,9 @@ off
         // Outdoor unit (request codes OCH694A)
         if (!publish_ha_float_sensor_auto_discover(F("outdoor_target_freq"), SensorType::FREQUENCY))
             return false;
+        // Actual frequency directly from the outdoor unit (code 16)
+        if (!publish_ha_float_sensor_auto_discover(F("outdoor_actual_freq"), SensorType::FREQUENCY))
+            return false;
         if (!publish_ha_string_sensor_auto_discover(F("freq_limitation"), F("mdi:speedometer-slow")))
             return false;
         if (!publish_ha_binary_sensor_auto_discover(F("freq_limited")))
@@ -1602,6 +1606,8 @@ off
             auto fresh = [&](int16_t code, uint32_t maxAge) { return hp::get_request_code_value(code, v, age) && age <= maxAge; };
 
             if (fresh(17, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("outdoor_target_freq"), float(v)))
+                return;
+            if (fresh(16, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("outdoor_actual_freq"), float(v)))
                 return;
             if (fresh(52, RC_MAX_AGE_FAST_S))
             {

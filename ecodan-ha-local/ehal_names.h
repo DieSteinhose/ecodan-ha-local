@@ -73,6 +73,7 @@ namespace ehal::names
 
         // Outdoor unit, request codes (OCH694A table 10-1; German terms from the manual: Heissgas, Verdichter)
         {"outdoor_target_freq",        "Verdichter Sollfrequenz",                      "Compressor target operating frequency"},
+        {"outdoor_actual_freq",        "Verdichter Ist-Frequenz (Außengerät)",         "Compressor operating frequency (outdoor unit)"},
         {"freq_limitation",            "Verdichter Frequenzregelzustand",              "Compressor frequency control state"},
         {"freq_limited",               "Verdichter Frequenzbegrenzung aktiv",          "Compressor frequency limited"},
         {"thermo_on_time",             "Thermo-EIN Laufzeit",                          "Thermostat ON operating time"},

@@ -85,8 +85,10 @@ namespace ehal::hp
         bool everRun;
     };
     // Fast group (every round) / slow group (5 min) / hourly.
-    // 16 (actual frequency) is skipped - already provided by GET 0x04 (compressor_frequency).
+    // 16 (actual frequency directly from the outdoor unit) back in the fast group - compare with GET 0x04
+    // of the FTC (now every 20 s) to see which source tracks the frequency faster. Round ~20-25 s.
     RcPoll rcPoll[] = {
+        {16, 0, {}, false},    // compressor actual frequency (outdoor unit)
         {17, 0, {}, false},    // compressor target frequency
         {52, 0, {}, false},    // frequency control state (limitation)
         {48, 0, {}, false},    // thermo ON time
@@ -169,6 +171,13 @@ namespace ehal::hp
 
     const auto RESPONSE_TIMEOUT = std::chrono::milliseconds(2000);  // 2x22 Byte @2400 8E1 ~ 200 ms
     const auto STATUS_INTERVAL = std::chrono::seconds(60);
+    // Fast cycle between full cycles: only THW6/THW7 (0x0D) and compressor frequency (0x04).
+    // Automations track the flow setpoint against THW6 (the FTC stops at THW6 >= setpoint + 2; THW6 rises at 36 Hz
+    // by up to 1.5 K/min) -> 60 s was too coarse. The full cycle resets the fast cycle timer
+    // (Result: values every 20 s, full cycle still every 60 s).
+    const auto FAST_STATUS_INTERVAL = std::chrono::seconds(20);
+    std::chrono::steady_clock::time_point lastFastStatusUpdate;
+    std::atomic<uint32_t> fastCycleCount{0};
     const auto STATUS_REFRESH_AFTER_SET = std::chrono::seconds(5);
     const uint8_t MAX_SET_ATTEMPTS = 2;
     const uint8_t MAX_CONSECUTIVE_TIMEOUTS = 5;
@@ -513,6 +522,46 @@ namespace ehal::hp
             log_web(F("status query restarted, %u requests of previous cycle were still pending"), dropped);
 
         return dispatch_next_cmd();
+    }
+
+    // Append the fast cycle (0x0D + 0x04). Identical GETs already waiting are not duplicated.
+    bool begin_get_fast_status()
+    {
+        {
+            std::lock_guard<std::mutex> lock{cmdQueueMutex};
+
+            const GetType types[] = {
+                GetType::DHW_TEMPERATURE_STATE_B,
+                GetType::COMPRESSOR_FREQUENCY,
+            };
+
+            for (auto t : types)
+            {
+                bool queued = false;
+                for (const auto& pending : getQueue)
+                {
+                    if (pending.msg.type() == MsgType::GET_CMD && pending.msg.payload_type<GetType>() == t)
+                    {
+                        queued = true;
+                        break;
+                    }
+                }
+                if (queued)
+                    continue;
+
+                PendingCmd pending;
+                pending.msg = Message{MsgType::GET_CMD, t};
+                getQueue.push_back(std::move(pending));
+            }
+        }
+
+        ++fastCycleCount;
+        return dispatch_next_cmd();
+    }
+
+    uint32_t get_fast_cycle_count()
+    {
+        return fastCycleCount;
     }
 
     String get_device_model()
@@ -1284,9 +1333,19 @@ namespace ehal::hp
             {
                 statusEverRequested = true;
                 lastStatusUpdate = now;
+                lastFastStatusUpdate = now; // the full cycle includes 0x0D/0x04
                 if (!begin_get_status())
                 {
                     log_web(F("Failed to begin heatpump status update!"));
+                }
+            }
+            else if (now - lastFastStatusUpdate >= FAST_STATUS_INTERVAL)
+            {
+                // Fast cycle: THW6/THW7 + compressor frequency
+                lastFastStatusUpdate = now;
+                if (!begin_get_fast_status())
+                {
+                    log_web(F("Failed to begin fast status update!"));
                 }
             }
         }

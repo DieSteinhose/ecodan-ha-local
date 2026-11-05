@@ -310,5 +310,6 @@ namespace ehal::hp
     bool get_request_code_value(int16_t code, uint16_t& value, uint32_t& ageS);
     String request_code_status_text(int16_t code, uint16_t value);
     uint32_t get_status_cycle_count(); // fully received status cycles since boot
+    uint32_t get_fast_cycle_count();   // fast cycles started (0x0D + 0x04, every 20 s) since boot
     uint64_t get_tx_msg_count();
 } // namespace ehal::hp
