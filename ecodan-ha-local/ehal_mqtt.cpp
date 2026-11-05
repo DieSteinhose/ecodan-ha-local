@@ -1299,9 +1299,8 @@ off
         // Outdoor unit (request codes OCH694A)
         if (!publish_ha_float_sensor_auto_discover(F("outdoor_target_freq"), SensorType::FREQUENCY))
             return false;
-        // Actual frequency directly from the outdoor unit (code 16)
-        if (!publish_ha_float_sensor_auto_discover(F("outdoor_actual_freq"), SensorType::FREQUENCY))
-            return false;
+        // Remove the former outdoor unit actual frequency sensor (code 16) - frequency comes via 0x04 (FTC)
+        remove_ha_entity(F("sensor"), F("outdoor_actual_freq"));
         if (!publish_ha_string_sensor_auto_discover(F("freq_limitation"), F("mdi:speedometer-slow")))
             return false;
         if (!publish_ha_binary_sensor_auto_discover(F("freq_limited")))
@@ -1606,8 +1605,6 @@ off
             auto fresh = [&](int16_t code, uint32_t maxAge) { return hp::get_request_code_value(code, v, age) && age <= maxAge; };
 
             if (fresh(17, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("outdoor_target_freq"), float(v)))
-                return;
-            if (fresh(16, RC_MAX_AGE_FAST_S) && !publish_sensor_status<float>(F("outdoor_actual_freq"), float(v)))
                 return;
             if (fresh(52, RC_MAX_AGE_FAST_S))
             {

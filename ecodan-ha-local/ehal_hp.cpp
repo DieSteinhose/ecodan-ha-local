@@ -85,10 +85,10 @@ namespace ehal::hp
         bool everRun;
     };
     // Fast group (every round) / slow group (5 min) / hourly.
-    // 16 (actual frequency directly from the outdoor unit) back in the fast group - compare with GET 0x04
-    // of the FTC (now every 20 s) to see which source tracks the frequency faster. Round ~20-25 s.
+    // 16 (actual frequency) removed again (was only added for comparison). Code 16 also goes through the FTC
+    // (GET 0xA3, response after 5-8 s) and is therefore not faster than GET 0x04, which now comes every 20 s.
+    // Still available on demand via /cn105_rc?rc=16.
     RcPoll rcPoll[] = {
-        {16, 0, {}, false},    // compressor actual frequency (outdoor unit)
         {17, 0, {}, false},    // compressor target frequency
         {52, 0, {}, false},    // frequency control state (limitation)
         {48, 0, {}, false},    // thermo ON time
