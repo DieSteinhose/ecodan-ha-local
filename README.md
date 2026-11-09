@@ -41,6 +41,21 @@ Current version: **v0.3.0**
 - Ready-made images for the LOLIN S2 Mini and generic ESP32 dev kits (4 MB flash or more),
   built automatically by GitHub Actions.
 
+## Switching from the original firmware
+
+Already running [rbroker/ecodan-ha-local](https://github.com/rbroker/ecodan-ha-local)?
+This fork is a drop-in replacement: no USB cable, no reflashing, no new setup.
+Just install the `-ota.bin` file as a normal firmware update in the web UI (see below).
+
+- Your settings (WiFi, MQTT, pins, password) stay as they are.
+- Your Home Assistant entities keep their IDs and history, the new sensors simply show up.
+  Zone 2 entities are removed if your system has no zone 2.
+- Pick the file for your board: `lolin_s2_mini` is for the ESP32-S2, `esp32dev` for the classic ESP32.
+  A file for the wrong chip is rejected at the end of the upload ("Could Not Activate The Firmware")
+  and your current firmware keeps running.
+- In rare cases the web update from an older firmware is aborted (e.g. a self-built firmware with a
+  newer ESP32 core). Then install once over USB with the factory file, after that updates work over WiFi again.
+
 ## Download & install
 
 Get the files from the [latest release](https://github.com/diesteinhose/ecodan-ha-local/releases/latest):
@@ -55,7 +70,6 @@ Get the files from the [latest release](https://github.com/diesteinhose/ecodan-h
   (the USB serial console is turned off in this build).
 - **Update:** Configuration page -> Firmware Update -> choose the `-ota.bin` file.
   Your settings are kept. Wait about 3 minutes until the diagnostics page shows `VALID`.
-- If the web update from an older firmware fails, install once over USB with the factory file.
 
 **Build it yourself** with [PlatformIO](https://platformio.org/): `pio run -e lolin_s2_mini` or `pio run -e esp32dev`.
 
