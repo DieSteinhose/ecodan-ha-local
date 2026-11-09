@@ -1,39 +1,109 @@
-name: Compile Sketch
+name: Build firmware
+
 on:
   push:
     branches:
-    - main
+      - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
-    - main
+      - main
   workflow_dispatch:
 
-jobs:       
+permissions:
+  contents: write
+
+jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     strategy:
+      fail-fast: false
       matrix:
-        fqbn:
-          - esp32:esp32:esp32
-          - esp32:esp32:esp32s3
-          - esp32:esp32:esp32c3
-          - esp32:esp32:lolin_s2_mini
+        env:
+          - lolin_s2_mini
+          - esp32dev
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/compile-sketches@main
+      - uses: actions/checkout@v5
         with:
-          fqbn: ${{ matrix.fqbn }}
-          platforms: |
-            - name: esp32:esp32
-              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          sketch-paths: |
-            - ecodan-ha-local
-          libraries: |
-            - name: ArduinoJson
-              version: 7.0.3
-            - name: Seeed_Arduino_mbedtls
-              version: 3.0.1
-            - name: MQTT
-              version: 2.5.2
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio==6.2.0
+
+      - name: Check firmware version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if ! grep -q "\"${GITHUB_REF_NAME}\"" ecodan-ha-local/ehal_config.cpp; then
+            echo "::error::get_software_version() does not return ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Build
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Collect binaries
+        run: |
+          version=$(git describe --tags --always)
+          name="ecodan-ha-local-${version}-${{ matrix.env }}"
+          mkdir -p dist
+          cp ".pio/build/${{ matrix.env }}/firmware.bin" "dist/${name}-ota.bin"
+          cp ".pio/build/${{ matrix.env }}/firmware-factory.bin" "dist/${name}-factory.bin"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: dist/*.bin
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        run: |
+          cd dist
+          sha256sum *.bin > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat > ../notes.md <<'EOF'
+          ## Firmware files
+
+          | File | Use it for |
+          |---|---|
+          | `*-lolin_s2_mini-ota.bin` | Update a LOLIN S2 Mini via the web UI (Configuration -> Firmware Update) |
+          | `*-lolin_s2_mini-factory.bin` | First install on a LOLIN S2 Mini over USB, flash to address `0x0` |
+          | `*-esp32dev-ota.bin` | Update a generic ESP32 dev kit (4 MB flash or more) via the web UI |
+          | `*-esp32dev-factory.bin` | First install on a generic ESP32 dev kit over USB, flash to address `0x0` |
+
+          Example for a first install: `esptool.py write_flash 0x0 <factory file>`
+
+          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for the list of changes.
+          EOF
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.bin
+            dist/SHA256SUMS.txt
