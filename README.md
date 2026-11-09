@@ -1,6 +1,73 @@
-![Build Status](https://github.com/rbroker/ecodan-ha-local/actions/workflows/build.yml/badge.svg)
+![Build Status](https://github.com/diesteinhose/ecodan-ha-local/actions/workflows/build.yml/badge.svg)
 
 # ecodan-ha-local
+
+Fork of [rbroker/ecodan-ha-local](https://github.com/rbroker/ecodan-ha-local), based on upstream v0.2.3.
+Current version: **v0.3.0**
+
+## What's changed in this fork
+
+**More stable**
+- No more crashes/reboots when several commands arrive at once (automations, sliders).
+- Only one request at a time goes to the heat pump. Commands are queued, not lost.
+- Fixed a boot loop with newer ESP32 cores (receive thread stack too small).
+- The bridge now reconnects reliably after a short WiFi dropout.
+- Fixed: setting the DHW temperature also changed the Zone 1 setpoint.
+
+**Safer firmware updates**
+- A new firmware runs in a test mode for about 3 minutes. If it crashes or can't talk
+  to the heat pump and MQTT, the previous firmware is restored automatically.
+- Upload errors are shown on the page instead of a silent reboot.
+
+**New values in Home Assistant**
+- Buffer tank temperature (THW10)
+- Compressor: on/off, operating hours, number of starts, average run time per start
+- Outdoor unit: target frequency, frequency limitation, thermo ON time, discharge
+  temperature (TH4), compressor current, superheat, sub-cool, air temperature (TH7),
+  actuators, control state, operating hours
+- THW6/THW7 and compressor frequency are updated every 20 seconds
+
+**Better Home Assistant integration**
+- Much less MQTT traffic: only changed values are sent, plus a full refresh every 2 minutes.
+- Zone 2 entities are only created if your system has zone 2 (read from the DIP switches).
+- Optional German or English entity names (configuration page). Entity IDs don't change.
+- Fixed sensor types (output power, energy counters, long-term statistics).
+
+**Web UI**
+- Heat pump page shows hydraulics, buffer tank, compressor and outdoor unit values.
+- Diagnostics page shows the reason of the last reset and WiFi disconnects.
+
+**Build**
+- Ready-made images for the LOLIN S2 Mini and generic ESP32 dev kits (4 MB flash or more),
+  built automatically by GitHub Actions.
+
+## Download & install
+
+Get the files from the [latest release](https://github.com/diesteinhose/ecodan-ha-local/releases/latest):
+
+| Board | First install (USB) | Update (web UI) |
+| ----- | ------------------- | --------------- |
+| LOLIN S2 Mini | `...-lolin_s2_mini-factory.bin` | `...-lolin_s2_mini-ota.bin` |
+| ESP32 dev kit, 4 MB flash or more | `...-esp32dev-factory.bin` | `...-esp32dev-ota.bin` |
+
+- **First install:** `esptool.py write_flash 0x0 <factory file>`.
+  On the LOLIN S2 Mini hold BOOT and press RST to enter download mode
+  (the USB serial console is turned off in this build).
+- **Update:** Configuration page -> Firmware Update -> choose the `-ota.bin` file.
+  Your settings are kept. Wait about 3 minutes until the diagnostics page shows `VALID`.
+- If the web update from an older firmware fails, install once over USB with the factory file.
+
+**Build it yourself** with [PlatformIO](https://platformio.org/): `pio run -e lolin_s2_mini` or `pio run -e esp32dev`.
+
+**Thanks to** [rbroker](https://github.com/rbroker/ecodan-ha-local) for the original project,
+[VonLatvala](https://github.com/VonLatvala/ecodan-ha-local) for sensor fixes and
+[gekkekoe](https://github.com/gekkekoe/esphome-ecodan-hp) for protocol details.
+
+---
+
+*The original README follows below.*
+
+## About
 ESP32 compatible program for local monitoring of Mitsubishi Ecodan Air to Water heat pumps with automatic discovery in HomeAssistant.
 
 Uses the CN105 connector on the Cased Flow Temp Controller (FTC6 in my setup) to do basic control.
