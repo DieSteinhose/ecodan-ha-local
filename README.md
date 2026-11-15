@@ -5,72 +5,27 @@
 Fork of [rbroker/ecodan-ha-local](https://github.com/rbroker/ecodan-ha-local), based on upstream v0.2.3.
 Current version: **v0.3.1**
 
-## What's new in v0.3.1
+## What's different from the original
 
-**Fixes**
-- Energy sensors (heating/cooling/DHW, consumed and delivered): Home Assistant counted far too little
-  in its long-term statistics and the energy dashboard. The heat pump reports the total of the previous
-  day; when a day was higher than the day before, only the difference was added. The sensors now use
-  `state_class: total` with a `last_reset` that follows the date of the value, so every day is added in full.
-  The MQTT payload of these six state topics is now JSON, e.g. `{"value":8.41,"date":"2026-11-14T00:00:00+00:00"}`.
-  Statistics recorded before the update are not corrected.
-- The web UI accepted saving the configuration, resetting it, uploading a firmware and reading the log
-  **without a login**, even with a device password set. All of them now need the login. Resetting the
-  configuration is a POST request now, and failed logins no longer write the attempted password to the log.
-- The configuration page broke if a password or SSID contained a quote, `<` or `&` (and saving it then
-  stored a truncated value).
-- "Heat pump connection state" could never report "disconnected": nothing was published while the heat pump
-  did not answer. Bridge diagnostics are now published independently, and MQTT reconnects in that state too.
-- The "Rebooting..." page after saving or updating got stuck instead of returning to the home page.
-- "Device Boot Time" on the diagnostics page always showed 1970.
-- Set points are rounded instead of truncated (20.3 was sent as 20.29).
+- **Stable under load:** no more crashes and restarts when several commands arrive at once
+  (automations, sliders). Commands are queued instead of lost, and the bridge reconnects reliably
+  after a WiFi dropout.
+- **Safe firmware updates:** a new firmware runs in a test mode for about 3 minutes. If it crashes
+  or cannot talk to the heat pump and MQTT, the previous firmware is restored automatically.
+- **More values in Home Assistant:** buffer tank temperature, compressor (on/off, operating hours,
+  starts, run time per start) and outdoor unit values such as discharge temperature, compressor
+  current, superheat and sub-cool. THW6/THW7 and the compressor frequency update every 20 seconds.
+- **Correct energy statistics:** the energy sensors are counted in full in Home Assistant's
+  long-term statistics and the energy dashboard.
+- **Lighter on MQTT:** only changed values are sent, plus a full refresh every 2 minutes.
+- **Zone 2 only if present:** zone 2 entities are created only if the system has zone 2
+  (read from the DIP switches).
+- **German or English entity names**, selectable on the configuration page. Entity IDs do not change.
+- **Device password also protects changes:** saving or resetting the configuration, firmware uploads
+  and the log require the login, not only the pages.
+- **Ready-made images** for the LOLIN S2 Mini and generic ESP32 dev kits, built by GitHub Actions.
 
-**More robust**
-- Values are only published once a full status cycle was read (no zeros after a restart, no stale values
-  after a reconnect).
-- Publishing to MQTT no longer blocks the serial receive thread (a slow broker could cause false timeouts).
-- A failed outdoor unit query is retried in the next round instead of an hour later.
-- Saving the configuration keeps every field that is not part of the request (scripts no longer wipe
-  settings by leaving a field out). Checkboxes can be set with `name=on` / `name=off`.
-- If an MQTT subscription fails, the connection is re-established instead of silently missing commands.
-- WiFi signal strength is sampled once a minute.
-- Serial packet dumps have their own log, so they no longer push the regular messages out.
-
-## What's changed in this fork
-
-**More stable**
-- No more crashes/reboots when several commands arrive at once (automations, sliders).
-- Only one request at a time goes to the heat pump. Commands are queued, not lost.
-- Fixed a boot loop with newer ESP32 cores (receive thread stack too small).
-- The bridge now reconnects reliably after a short WiFi dropout.
-- Fixed: setting the DHW temperature also changed the Zone 1 setpoint.
-
-**Safer firmware updates**
-- A new firmware runs in a test mode for about 3 minutes. If it crashes or can't talk
-  to the heat pump and MQTT, the previous firmware is restored automatically.
-- Upload errors are shown on the page instead of a silent reboot.
-
-**New values in Home Assistant**
-- Buffer tank temperature (THW10)
-- Compressor: on/off, operating hours, number of starts, average run time per start
-- Outdoor unit: target frequency, frequency limitation, thermo ON time, discharge
-  temperature (TH4), compressor current, superheat, sub-cool, air temperature (TH7),
-  actuators, control state, operating hours
-- THW6/THW7 and compressor frequency are updated every 20 seconds
-
-**Better Home Assistant integration**
-- Much less MQTT traffic: only changed values are sent, plus a full refresh every 2 minutes.
-- Zone 2 entities are only created if your system has zone 2 (read from the DIP switches).
-- Optional German or English entity names (configuration page). Entity IDs don't change.
-- Fixed sensor types (output power, energy counters, long-term statistics).
-
-**Web UI**
-- Heat pump page shows hydraulics, buffer tank, compressor and outdoor unit values.
-- Diagnostics page shows the reason of the last reset and WiFi disconnects.
-
-**Build**
-- Ready-made images for the LOLIN S2 Mini and generic ESP32 dev kits (4 MB flash or more),
-  built automatically by GitHub Actions.
+All changes per version, including fixes and upgrade notes, are in the [changelog](CHANGELOG.md).
 
 ## Switching from the original firmware
 
