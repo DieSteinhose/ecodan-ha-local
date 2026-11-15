@@ -3,7 +3,38 @@
 # ecodan-ha-local
 
 Fork of [rbroker/ecodan-ha-local](https://github.com/rbroker/ecodan-ha-local), based on upstream v0.2.3.
-Current version: **v0.3.0**
+Current version: **v0.3.1**
+
+## What's new in v0.3.1
+
+**Fixes**
+- Energy sensors (heating/cooling/DHW, consumed and delivered): Home Assistant counted far too little
+  in its long-term statistics and the energy dashboard. The heat pump reports the total of the previous
+  day; when a day was higher than the day before, only the difference was added. The sensors now use
+  `state_class: total` with a `last_reset` that follows the date of the value, so every day is added in full.
+  The MQTT payload of these six state topics is now JSON, e.g. `{"value":8.41,"date":"2026-11-14T00:00:00+00:00"}`.
+  Statistics recorded before the update are not corrected.
+- The web UI accepted saving the configuration, resetting it, uploading a firmware and reading the log
+  **without a login**, even with a device password set. All of them now need the login. Resetting the
+  configuration is a POST request now, and failed logins no longer write the attempted password to the log.
+- The configuration page broke if a password or SSID contained a quote, `<` or `&` (and saving it then
+  stored a truncated value).
+- "Heat pump connection state" could never report "disconnected": nothing was published while the heat pump
+  did not answer. Bridge diagnostics are now published independently, and MQTT reconnects in that state too.
+- The "Rebooting..." page after saving or updating got stuck instead of returning to the home page.
+- "Device Boot Time" on the diagnostics page always showed 1970.
+- Set points are rounded instead of truncated (20.3 was sent as 20.29).
+
+**More robust**
+- Values are only published once a full status cycle was read (no zeros after a restart, no stale values
+  after a reconnect).
+- Publishing to MQTT no longer blocks the serial receive thread (a slow broker could cause false timeouts).
+- A failed outdoor unit query is retried in the next round instead of an hour later.
+- Saving the configuration keeps every field that is not part of the request (scripts no longer wipe
+  settings by leaving a field out). Checkboxes can be set with `name=on` / `name=off`.
+- If an MQTT subscription fails, the connection is re-established instead of silently missing commands.
+- WiFi signal strength is sampled once a minute.
+- Serial packet dumps have their own log, so they no longer push the regular messages out.
 
 ## What's changed in this fork
 
@@ -250,7 +281,7 @@ Note: If this setting or "WiFi SSID" are unset, the device will continue to boot
 Some parameters of your Mitsubishi Ecodan HVAC
 | Description | Default  |
 | ----------- | -------- |
-| Check this option to fall back to broadcasting a "captive portal" WiFi access point if the network connection is lost for a long time (~20 mins). Intended to avoid the need for physically accessing the ESP32 if (e.g. a router is replaced, and the SSID / password are different). If a device password is set, a device password will be required to connect to the captive port access point. | `False` |
+| Check this option to fall back to broadcasting a "captive portal" WiFi access point if no network connection can be established for 10 minutes after a start. **The saved WiFi SSID and password are erased in that case.** Intended to avoid the need for physically accessing the ESP32 if (e.g. a router is replaced, and the SSID / password are different). Turn it off if your WiFi may be unavailable for longer than that (the bridge then keeps retrying instead). | `True` |
 
 ### Hostname
 The network hostname the device will use to identify itself.
