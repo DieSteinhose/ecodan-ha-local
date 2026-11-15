@@ -98,7 +98,7 @@ jobs:
 
           Example for a first install: `esptool.py write_flash 0x0 <factory file>`
 
-          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for the list of changes.
+          See the [changelog](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for the list of changes.
           EOF
 
       - uses: softprops/action-gh-release@v2
