@@ -29,7 +29,6 @@ namespace ehal
         config.CoolEnabled = prefs.getBool("cool_enabled", false);
         config.UniqueId = prefs.getString("unique_id", device_mac());
         config.WifiReset = prefs.getBool("wifi_reset", true);
-        config.HostName = prefs.getString("hostname", "ecodan_ha_local");
         config.WifiSsid = prefs.getString("wifi_ssid");
         config.WifiPassword = prefs.getString("wifi_pw");
         config.HostName = prefs.getString("hostname", "ecodan_ha_local");
@@ -87,12 +86,15 @@ namespace ehal
         return config.WifiSsid.isEmpty() || config.WifiPassword.isEmpty();
     }
 
+// The release workflow checks that this matches the git tag.
+#define EHAL_VERSION "v0.3.1"
+
     String get_software_version()
     {
 #ifdef EHAL_VERSION_SUFFIX
-        return String(F("v0.3.0")) + F(EHAL_VERSION_SUFFIX);
+        return String(F(EHAL_VERSION)) + F(EHAL_VERSION_SUFFIX);
 #else
-        return FPSTR("v0.3.0");
+        return F(EHAL_VERSION);
 #endif
     }
 

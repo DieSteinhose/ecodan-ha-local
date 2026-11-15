@@ -48,17 +48,18 @@ namespace ehal
 </nav>
 <br />
 <form method="post" action="save">
+    <input type="hidden" name="form" value="1" />
     <h2>Device:</h2>
     <div class="row">
         <label class="column column-25" for="device_pw">Device Password:</label>
-        <input class="column column-75" type="password" id="device_pw" max-length="100" name="device_pw" value="{{device_pw}}" />
+        <input class="column column-75" type="password" id="device_pw" maxlength="100" name="device_pw" value="{{device_pw}}" />
     </div>
     <div class="row">
-        <label class="column column-25" for="device_rx">Serial Rx Port:</label>
+        <label class="column column-25" for="serial_rx">Serial Rx Port:</label>
         <input class="column column-75" type="text" inputmode="numeric" id="serial_rx" name="serial_rx" value="{{serial_rx}}" required />
     </div>
     <div class="row">
-        <label class="column column-25" for="device_tx">Serial Tx Port:</label>
+        <label class="column column-25" for="serial_tx">Serial Tx Port:</label>
         <input class="column column-75" type="text" inputmode="numeric" id="serial_tx" name="serial_tx" value="{{serial_tx}}" required />
     </div>
     <div class="row">
@@ -83,7 +84,7 @@ namespace ehal
     <h2>Device Unique id</h2>
     <div class="row">
         <label class="column column-25" for="unique_id">Device Unique Id:</label>
-        <input class="column column-75" type="text" id="unique_id" max-length="11" name="unique_id" value="{{unique_id}}" />
+        <input class="column column-75" type="text" id="unique_id" maxlength="32" name="unique_id" value="{{unique_id}}" />
     </div>
     <br />
     <h2>WiFi Configuration:</h2>
@@ -162,7 +163,7 @@ namespace ehal
 </form>
 )";
 
-    const char* BODY_TEMPLATE_CONFIG_SAVED PROGMEM = R"(<p>Configuration Saved! Rebooting... (this should take a few seconds!) <span id="reboot_progress"><span> <a href="/">Home</a></p>)";
+    const char* BODY_TEMPLATE_CONFIG_SAVED PROGMEM = R"(<p>Configuration Saved! Rebooting... (this should take a few seconds!) <span id="reboot_progress"></span> <a href="/">Home</a></p>)";
 
     const char* BODY_TEMPLATE_CONFIG_CLEARED PROGMEM = R"(<p>Configuration Reset To Default! Rebooting... (this should take a few seconds!) <span id="reboot_progress"></span> <a href="/">Home</a></p>)";
 
@@ -227,6 +228,7 @@ namespace ehal
     <tr>
         <td>WiFi IP:</td>
         <td>{{wifi_ip}}</td>
+    </tr>
     <tr>
         <td>WiFi Gateway IP:</td>
         <td>{{wifi_gateway_ip}}</td>
@@ -252,11 +254,11 @@ namespace ehal
         <td>{{wifi_diag}}</td>
     </tr>
     <tr>
-        <td>HomeAssistant Heat Pump Zone 1 Entity:</td>
+        <td>HomeAssistant Zone 1 Climate Unique ID:</td>
         <td>{{ha_hp_entity}}</td>
     </tr>
     <tr>
-        <td>HomeAssistant Heat Pump Zone 2 Entity:</td>
+        <td>HomeAssistant Zone 2 Climate Unique ID:</td>
         <td>{{ha_hp_z2_entity}}</td>
     </tr>
     <tr>
@@ -270,7 +272,12 @@ namespace ehal
 </table>
 <h2>Logs</h2>
 <pre><code class="column column-33 column-offset-33" style="max-height:250px;overflow:auto;" id="logs">
-</code></pre>)";
+</code></pre>
+<div id="packets_box" style="display:none;">
+<h2>Serial Packets</h2>
+<pre><code class="column column-33 column-offset-33" style="max-height:250px;overflow:auto;" id="packets">
+</code></pre>
+</div>)";
 
     const char* BODY_TEMPLATE_HEAT_PUMP PROGMEM = R"(<h1>Heat Pump</h1>
 <nav class="row">
@@ -283,14 +290,14 @@ namespace ehal
 <table>
     <thead>
         <th colspan="2">Temperatures</th>
-    <thead>
+    </thead>
     <tr>
         <td>Zone 1 Room Temperature:</td>
         <td>{{z1_room_temp}} / {{z1_set_temp}}&#176;C</td>
     </tr>
     <tr>
         <td>Zone 2 Room Temperature:</td>
-        <td>{{z2_room_temp}} / {{z2_set_temp}}&#176;C</td>
+        <td>{{z2_temps}}</td>
     </tr>
     <tr>
         <td>DHW Tank Temperature:</td>
@@ -355,7 +362,7 @@ namespace ehal
         <td><code>{{raw_0f}}</code><br /><code>{{raw_13}}</code><br /><code>{{raw_0e}}</code><br /><a href="/cn105_probe">all raw responses / probe</a></td>
     </tr>
     <thead>
-        <th colspan="2">Efficiency (Last 24h)</th>
+        <th colspan="2">Efficiency ({{energy_date}})</th>
     </thead>
     <tr>
         <td>Space Heating:</td>
@@ -426,7 +433,7 @@ namespace ehal
     </div>
     <br />
     <div class="row">
-        <input class="button column column-25 column-offset-75" type="submit" value="Login" class="button" />
+        <input class="button column column-25 column-offset-75" type="submit" value="Login" />
     </div>
 </form>
 )";

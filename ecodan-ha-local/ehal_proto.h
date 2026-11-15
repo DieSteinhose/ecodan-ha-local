@@ -150,7 +150,7 @@ namespace ehal::hp
             if (!valid_)
                 return;
 
-            log_web(F("%s { .Hdr { %x, %x, %x, %x, %x } .Payload { %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x } .Chk { %x } }"),
+            log_packet(F("%s { .Hdr { %x, %x, %x, %x, %x } .Payload { %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x } .Chk { %x } }"),
                     cmd_ ? "CMD" : "RES",
                     buffer_[0], buffer_[1], buffer_[2], buffer_[3], buffer_[4],
                     buffer_[5], buffer_[6], buffer_[7], buffer_[8], buffer_[9],
@@ -303,7 +303,8 @@ namespace ehal::hp
 
         void set_float16(float value, size_t index)
         {
-            uint16_t u16 = uint16_t(value * 100.0f);
+            // Round instead of truncating: 20.3f * 100 = 2029.99... was sent as 20.29.
+            uint16_t u16 = uint16_t(value * 100.0f + 0.5f);
 
             payload()[index] = highByte(u16);
             payload()[index + 1] = lowByte(u16);

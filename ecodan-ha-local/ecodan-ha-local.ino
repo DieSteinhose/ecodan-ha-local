@@ -108,19 +108,29 @@ void update_time(bool force)
     }
 }
 
-void set_boot_time()
+// Sets the boot time once the clock is synchronised. Upstream read the clock right after starting
+// NTP in setup(), when it still showed 1970 - the diagnostics page always said "1970-01-01T00:00:01Z".
+void update_boot_time()
 {
-    auto& config = ehal::config_instance();
-
-    const size_t len = 21; // "yyyy-mm-ddThh:mm:ssZ\0"
-    auto buffer = std::unique_ptr<char[]>(new char[len]);
-    time_t now = time(nullptr);
-    struct tm t = *localtime(&now);
-
-    if (strftime(buffer.get(), len, "%FT%TZ", &t) == 0)
+    static bool done = false;
+    if (done)
         return;
 
-    config.BootTime = String(buffer.get());
+    time_t now = time(nullptr);
+    if (now < 1600000000) // not synchronised yet (clock starts at 1970)
+        return;
+
+    done = true;
+
+    time_t boot = now - static_cast<time_t>(millis() / 1000);
+    struct tm t = {};
+    gmtime_r(&boot, &t);
+
+    char buffer[21]; // "yyyy-mm-ddThh:mm:ssZ\0"
+    if (strftime(buffer, sizeof(buffer), "%FT%TZ", &t) == 0)
+        return;
+
+    ehal::config_instance().BootTime = String(buffer);
 }
 
 void update_status_led()
@@ -242,7 +252,7 @@ void setup()
     initialize_wifi_access_point();
 
     update_time(/* force =*/true);
-    set_boot_time();
+    ehal::config_instance().BootTime = F("unknown (waiting for time synchronisation)");
 
     if (ehal::requires_first_time_configuration())
     {
@@ -282,6 +292,7 @@ void loop()
             ehal::mqtt::handle_loop();
 
         update_time(/* force =*/false);
+        update_boot_time();
         update_status_led();
 
         reboot_if_wifi_disconnected_too_long();

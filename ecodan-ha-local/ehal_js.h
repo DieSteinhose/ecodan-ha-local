@@ -7,7 +7,9 @@ namespace ehal
      * by a network scan, without blocking page load. If any of the returned SSIDs match the SSID we've previously
      * saved in our preferences, then attempt to select it automatically.
      */
-    const char* SCRIPT_CONFIGURATION_PAGE PROGMEM = R"(function update_ssi() {
+    const char* SCRIPT_CONFIGURATION_PAGE PROGMEM = R"(let wifi = [];
+
+    function update_ssi() {
         let selected = document.getElementById('wifi_ssid');
         for (let i = 0; i < wifi.length; ++i) {
             if (wifi[i].ssid != selected.value)
@@ -67,15 +69,19 @@ namespace ehal
 
             enable_all_inputs();
         }
-        xhttp.error = enable_all_inputs;
-        xhttp.timeout = enable_all_inputs;
+        xhttp.onerror = enable_all_inputs;
+        xhttp.ontimeout = enable_all_inputs;
         xhttp.send();
     }
 
     function clear_config() {
         if (window.confirm("This will reset all configuration settings to their default values and reboot the device. Are you sure?")) {
             disable_all_inputs();
-            window.location = '/clear_config';
+            let form = document.createElement('form');
+            form.method = 'post';
+            form.action = '/clear_config';
+            document.body.appendChild(form);
+            form.submit();
         }
     }
 
@@ -139,8 +145,8 @@ namespace ehal
 
     const char* SCRIPT_WAIT_REBOOT PROGMEM = R"(function check_alive() {
         let xhttp = new XMLHttpRequest();
-        xhttp.open('GET', 'query_life', true);
-        xhttp.timeout = 1000;
+        xhttp.open('GET', '/query_life', true);
+        xhttp.timeout = 2000;
         xhttp.onload = function() {
             if (this.status == 200) {
                 window.location = '/';
@@ -148,40 +154,52 @@ namespace ehal
                 update_reboot_progress();
             }
         }
-        xhttp.error = update_reboot_progress;
-        xhttp.timeout = update_reboot_progress;
+        xhttp.onerror = update_reboot_progress;
+        xhttp.ontimeout = update_reboot_progress;
         xhttp.send();
     }
 
     function update_reboot_progress() {
-         let rebootProgress = document.getElementById('reboot_progress');
-        rebootProgress.textContent += '.';
-        check_alive();
+        let rebootProgress = document.getElementById('reboot_progress');
+        if (rebootProgress) {
+            rebootProgress.textContent += '.';
+        }
+        window.setTimeout(check_alive, 1000);
     }
 
     function trigger_life_check() {
-        window.setTimeout(check_alive, 2000);
+        window.setTimeout(check_alive, 3000);
     }
 
-    let wifi = [];
-    window.addEventListener('load', trigger_life_check))";
+    if (document.readyState == 'complete') {
+        trigger_life_check();
+    } else {
+        window.addEventListener('load', trigger_life_check);
+    })";
 
-    const char* SCRIPT_UPDATE_DIAGNOSTIC_LOGS PROGMEM = R"(function update_diagnostic_logs() {
+    const char* SCRIPT_UPDATE_DIAGNOSTIC_LOGS PROGMEM = R"(function append_log_lines(element, lines) {
+        let didLogsChange = false;
+        for (let i = 0; i < lines.length; ++i) {
+            if (element.textContent.indexOf(lines[i]) == -1) {
+                element.textContent += lines[i] + '\n';
+                didLogsChange = true;
+            }
+        }
+        if (didLogsChange) {
+            element.scrollTop = element.scrollHeight;
+        }
+    }
+
+    function update_diagnostic_logs() {
         let xhttp = new XMLHttpRequest();
         xhttp.open('GET', 'query_diagnostic_logs', true);
         xhttp.onload = function() {
-            let element = document.getElementById('logs');
             if (this.status == 200) {
-                let didLogsChange = false;
                 let jsonResponse = JSON.parse(this.responseText);
-                for (let i = 0; i < jsonResponse.messages.length; ++i) {
-                    if (element.textContent.indexOf(jsonResponse.messages[i]) == -1) {
-                        element.textContent += jsonResponse.messages[i] + '\n';
-                        didLogsChange = true;
-                    }
-                }
-                if (didLogsChange) {
-                    element.scrollTop = element.scrollHeight;
+                append_log_lines(document.getElementById('logs'), jsonResponse.messages);
+                if (jsonResponse.packets && jsonResponse.packets.length > 0) {
+                    document.getElementById('packets_box').style.display = '';
+                    append_log_lines(document.getElementById('packets'), jsonResponse.packets);
                 }
             }
         }

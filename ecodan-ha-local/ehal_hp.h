@@ -6,10 +6,10 @@
 
 namespace ehal::hp
 {
-    struct Status
+    // Plain values of the last status cycle. Copyable, so callers can take a snapshot
+    // under the lock and then work on it without blocking the serial RX thread.
+    struct StatusData
     {
-        bool Initialized = false;
-
         bool DefrostActive;
         bool DhwForcedActive;
         uint8_t OutputPower;
@@ -91,6 +91,10 @@ namespace ehal::hp
         float EnergyDeliveredCooling;
         float EnergyConsumedDhw;
         float EnergyDeliveredDhw;
+        // GET 0xA1/0xA2 report the totals of ONE finished day (usually yesterday); bytes 1..3 hold
+        // that date. Encoded as (year - 2000) << 16 | month << 8 | day, 0 = not received yet / invalid.
+        uint32_t EnergyConsumedDate = 0;
+        uint32_t EnergyDeliveredDate = 0;
 
         // HomeAssistant is a bit restrictive about what is let's us specify
         // as the mode/action of a climate integration.
@@ -102,17 +106,17 @@ namespace ehal::hp
                     switch (HeatingCoolingMode)
                     {
                       case HpMode::HEAT_ROOM_TEMP:
-                          [[fallthrough]]
+                          [[fallthrough]];
                       case HpMode::HEAT_FLOW_TEMP:
-                          [[fallthrough]]
+                          [[fallthrough]];
                       case HpMode::HEAT_COMPENSATION_CURVE:
                           return F("heat");
                       case HpMode::COOL_ROOM_TEMP:
-                          [[fallthrough]]
+                          [[fallthrough]];
                       case HpMode::COOL_FLOW_TEMP:
                           return F("cool");
                     }
-                    [[fallthrough]]
+                    [[fallthrough]];
                 default:
                     return F("off");
             }
@@ -123,15 +127,15 @@ namespace ehal::hp
             switch (Operation)
             {
                 case OperationMode::SH_ON:
-                    [[fallthrough]]
+                    [[fallthrough]];
                 case OperationMode::FROST_PROTECT:
                     return F("heating");
                 case OperationMode::COOL_ON:
                     return F("cooling");
                 case OperationMode::OFF:
-                    [[fallthrough]]
+                    [[fallthrough]];
                 case OperationMode::DHW_ON:
-                    [[fallthrough]]
+                    [[fallthrough]];
                 default:
                     return F("idle");
             }
@@ -231,7 +235,10 @@ namespace ehal::hp
         {
             HeatingCoolingMode = static_cast<HpMode>(mode);
         }
+    };
 
+    struct Status : StatusData
+    {
         void lock()
         {
             lock_.lock();
@@ -248,6 +255,10 @@ namespace ehal::hp
 
     String get_device_model();
     Status& get_status();
+    StatusData get_status_snapshot(); // copy taken under the lock
+
+    // "yyyy-mm-dd" for an EnergyConsumedDate/EnergyDeliveredDate value, "" if unknown
+    String energy_date_as_string(uint32_t date);
 
     float get_temperature_step();
     float get_min_thermostat_temperature();
@@ -273,6 +284,9 @@ namespace ehal::hp
     bool initialize();
     void handle_loop();
     bool is_connected();
+    // true once a full status cycle was received since the last (re)connect. Before that the
+    // values are zero (after boot) or stale (after a reconnect) and must not be published.
+    bool is_status_fresh();
 
     uint64_t get_rx_msg_count();
 

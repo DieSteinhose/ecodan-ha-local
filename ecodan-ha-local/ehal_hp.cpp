@@ -186,6 +186,28 @@ namespace ehal::hp
     Status status;
     float temperatureStep = 0.5f;
     std::atomic<bool> connected{false};
+    std::atomic<bool> statusFresh{false};
+
+    // Bookkeeping of the full status cycle since the last (re)connect (guarded by cmdQueueMutex).
+    bool cycleRunning = false;
+    uint8_t cycleSkips = 0;         // requests of the running cycle that got no answer
+    uint8_t cyclesSinceConnect = 0; // finished cycles
+    const uint8_t MAX_CYCLES_UNTIL_FRESH = 3;
+
+    // Marks the connection to the FTC as lost; the status has to be re-read before it is published again.
+    void set_disconnected()
+    {
+        statusFresh = false;
+        connected = false;
+    }
+
+    // Date bytes of GET 0xA1/0xA2 (year - 2000, month, day) -> packed value, 0 if implausible.
+    uint32_t pack_energy_date(uint8_t year, uint8_t month, uint8_t day)
+    {
+        if (month < 1 || month > 12 || day < 1 || day > 31)
+            return 0;
+        return (uint32_t(year) << 16) | (uint32_t(month) << 8) | day;
+    }
 
     bool serial_tx(Message& msg)
     {
@@ -332,6 +354,35 @@ namespace ehal::hp
         return true;
     }
 
+    // Called with cmdQueueMutex held when the last request of the status cycle (0xA2) was answered
+    // or timed out. The status counts as fresh once a cycle finished without a skipped request.
+    // If requests were skipped the cycle is repeated right away; after MAX_CYCLES_UNTIL_FRESH cycles
+    // the status counts as fresh anyway (an FTC that never answers one of the types must not keep
+    // all other values from being published).
+    void end_status_cycle_locked()
+    {
+        if (!cycleRunning)
+            return; // late or probe response outside a cycle
+
+        cycleRunning = false;
+        if (cyclesSinceConnect < 255)
+            ++cyclesSinceConnect;
+
+        if (statusFresh)
+            return;
+
+        if (cycleSkips == 0 || cyclesSinceConnect >= MAX_CYCLES_UNTIL_FRESH)
+        {
+            if (connected)
+                statusFresh = true;
+        }
+        else
+        {
+            statusRefreshPending = true;
+            statusRefreshDue = std::chrono::steady_clock::now();
+        }
+    }
+
     // Sends the next command, but only if none is waiting for a response.
     bool dispatch_next_cmd()
     {
@@ -363,7 +414,7 @@ namespace ehal::hp
 
             clear_command_queue();
 
-            connected = false;
+            set_disconnected();
             return false;
         }
 
@@ -403,6 +454,15 @@ namespace ehal::hp
             awaitingResponse = false;
             type = expectedPayloadType;
 
+            if (inflight.msg.type() == MsgType::GET_CMD)
+            {
+                // Request codes (0xA3) are retried on their own and are not part of the status.
+                if (cycleRunning && type != static_cast<uint8_t>(GetType::SERVICE_REQUEST_CODE))
+                    ++cycleSkips;
+                if (type == static_cast<uint8_t>(GetType::ENERGY_DELIVERY))
+                    end_status_cycle_locked();
+            }
+
             if (++consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS)
             {
                 giveUp = true;
@@ -426,7 +486,7 @@ namespace ehal::hp
                 std::lock_guard<std::mutex> lock{cmdQueueMutex};
                 getQueue.clear();
             }
-            connected = false;
+            set_disconnected();
             return;
         }
 
@@ -483,6 +543,8 @@ namespace ehal::hp
             // Only restart the GET cycle; pending SET commands are kept.
             dropped = getQueue.size();
             getQueue.clear();
+            cycleRunning = true;
+            cycleSkips = 0;
 
             const GetType types[] = {
                 GetType::DEFROST_STATE,
@@ -574,6 +636,21 @@ namespace ehal::hp
         return status;
     }
 
+    StatusData get_status_snapshot()
+    {
+        std::lock_guard<Status> lock{status};
+        return static_cast<const StatusData&>(status);
+    }
+
+    String energy_date_as_string(uint32_t date)
+    {
+        if (date == 0)
+            return String();
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%04u-%02u-%02u", (unsigned)(2000 + ((date >> 16) & 0xFF)), (unsigned)((date >> 8) & 0xFF), (unsigned)(date & 0xFF));
+        return String(buf);
+    }
+
     float get_temperature_step()
     {
         return temperatureStep;
@@ -636,7 +713,7 @@ namespace ehal::hp
         Message cmd{MsgType::SET_CMD, SetType::BASIC_SETTINGS};
         cmd[1] = SET_SETTINGS_FLAG_ZONE_TEMPERATURE;
         cmd[2] = static_cast<uint8_t>(SetZone::BOTH);
-        cmd.set_float16(status.Zone1SetTemperature, 10);
+        cmd.set_float16(get_status_snapshot().Zone1SetTemperature, 10);
         cmd.set_float16(newTemp, 12);
 
         if (!enqueue_set_cmd(std::move(cmd)))
@@ -1001,15 +1078,21 @@ namespace ehal::hp
                 status.DhwTimerMode = res[5] > 0;
                 break;
             case GetType::ENERGY_USAGE:
+                status.EnergyConsumedDate = pack_energy_date(res[1], res[2], res[3]);
                 status.EnergyConsumedHeating = res.get_float24(4);
                 status.EnergyConsumedCooling = res.get_float24(7);
                 status.EnergyConsumedDhw = res.get_float24(10);
                 break;
             case GetType::ENERGY_DELIVERY:
+                status.EnergyDeliveredDate = pack_energy_date(res[1], res[2], res[3]);
                 status.EnergyDeliveredHeating = res.get_float24(4);
                 status.EnergyDeliveredCooling = res.get_float24(7);
                 status.EnergyDeliveredDhw = res.get_float24(10);
                 ++statusCycleCount; // last type in the cycle
+                {
+                    std::lock_guard<std::mutex> cycleLock{cmdQueueMutex}; // lock order status -> cmdQueue
+                    end_status_cycle_locked();
+                }
                 {
                     // Log the RX thread's stack headroom once per boot.
                     static bool stackLogged = false;
@@ -1046,8 +1129,15 @@ namespace ehal::hp
             std::lock_guard<std::mutex> lock{cmdQueueMutex};
             awaitingResponse = false;
             consecutiveTimeouts = 0;
+
+            // Read the full status right away instead of waiting for the next 60 s cycle.
+            statusRefreshPending = true;
+            statusRefreshDue = std::chrono::steady_clock::now();
+            cycleRunning = false;
+            cyclesSinceConnect = 0;
         }
 
+        statusFresh = false; // values are from before the connection loss until the next full cycle
         connected = true;
 
         // Send any commands that arrived while disconnected.
@@ -1241,6 +1331,12 @@ namespace ehal::hp
                     failed = slot.code;
                     rcResults[slot.code].gaveUp = true;
                     (slot.parallel ? rcStatsParallel : rcStatsSingle).failures++;
+                    // Retry in the next round instead of waiting a whole interval. About 0.7 % of the
+                    // queries fail; for the hourly codes the value then got too old to be published
+                    // and the Home Assistant sensor was unavailable for almost an hour.
+                    for (auto& p : rcPoll)
+                        if (p.code == slot.code)
+                            p.everRun = false;
                     slot.code = -1;
                     continue;
                 }
@@ -1354,6 +1450,11 @@ namespace ehal::hp
     bool is_connected()
     {
         return connected;
+    }
+
+    bool is_status_fresh()
+    {
+        return connected && statusFresh;
     }
 
     uint64_t get_tx_msg_count()

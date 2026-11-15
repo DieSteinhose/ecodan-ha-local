@@ -41,6 +41,52 @@ namespace ehal::http
         return buffer;
     }
 
+    // Escape a value for use inside HTML text or a quoted attribute. Without this a password or
+    // SSID containing a quote, '<' or '&' broke the configuration form - and saving the page then
+    // stored the truncated value. '{' is escaped too, so a value can never look like a "{{...}}" placeholder.
+    String html_escape(const String& value)
+    {
+        String out;
+        out.reserve(value.length() + 8);
+        for (size_t i = 0; i < value.length(); ++i)
+        {
+            const char c = value[i];
+            switch (c)
+            {
+            case '&': out += F("&amp;"); break;
+            case '<': out += F("&lt;"); break;
+            case '>': out += F("&gt;"); break;
+            case '"': out += F("&quot;"); break;
+            case '\'': out += F("&#39;"); break;
+            case '{': out += F("&#123;"); break;
+            default: out += c; break;
+            }
+        }
+        return out;
+    }
+
+    // Escape a value for use inside a single-quoted JavaScript string literal.
+    String js_escape(const String& value)
+    {
+        String out;
+        out.reserve(value.length() + 8);
+        for (size_t i = 0; i < value.length(); ++i)
+        {
+            const char c = value[i];
+            switch (c)
+            {
+            case '\\': out += F("\\\\"); break;
+            case '\'': out += F("\\'"); break;
+            case '\n': out += F("\\n"); break;
+            case '\r': out += F("\\r"); break;
+            case '<': out += F("\\x3C"); break;
+            case '{': out += F("\\x7B"); break;
+            default: out += c; break;
+            }
+        }
+        return out;
+    }
+
     String configuration_status()
     {
         Config& config = config_instance();
@@ -85,19 +131,16 @@ namespace ehal::http
         return cookie;
     }
 
-    bool show_login_if_required()
+    // true if the current request is NOT allowed: a device password is set and the client
+    // did not send the login cookie. No login during first time configuration (captive portal)
+    // and when no device password is set.
+    bool login_required()
     {
         if (requires_first_time_configuration())
-        {
-            log_web(F("Skipping login, as first time configuration is required"));
             return false;
-        }
 
         if (config_instance().DevicePassword.isEmpty())
-        {
-            log_web(F("Skipping login, as device password is unset."));
             return false;
-        }
 
         if (!loginCookie.isEmpty())
         {
@@ -106,18 +149,33 @@ namespace ehal::http
             {
                 return false;
             }
+        }
 
-            log_web(F("Client cookie mismatch, redirecting to login page"));
-        }
-        else
-        {
-            log_web(F("Login cookie is unset, redirecting to login page"));
-        }
+        return true;
+    }
+
+    // For pages: shows the login page instead if the client is not logged in.
+    bool show_login_if_required()
+    {
+        if (!login_required())
+            return false;
 
         String page{FPSTR(PAGE_TEMPLATE)};
         page.replace(F("{{PAGE_SCRIPT}}"), "");
         page.replace(F("{{PAGE_BODY}}"), FPSTR(BODY_TEMPLATE_LOGIN));
-        server.send(200, F("text/html"), page);
+        // 401 for everything but a page view, so a script notices that e.g. its /save was not accepted
+        // (the login cookie is only valid until the next restart). Browsers show the page either way.
+        server.send(server.method() == HTTP_GET ? 200 : 401, F("text/html"), page);
+        return true;
+    }
+
+    // For data endpoints (XMLHttpRequest, scripts): answers 401 if the client is not logged in.
+    bool reject_if_login_required()
+    {
+        if (!login_required())
+            return false;
+
+        server.send(401, F("text/plain"), F("login required"));
         return true;
     }
 
@@ -156,7 +214,7 @@ namespace ehal::http
         page.replace(F("{{PAGE_BODY}}"), F(BODY_TEMPLATE_CONFIG));
 
         Config& config = config_instance();
-        page.replace(F("{{device_pw}}"), config.DevicePassword);
+        page.replace(F("{{device_pw}}"), html_escape(config.DevicePassword));
         page.replace(F("{{serial_rx}}"), String(config.SerialRxPort));
         page.replace(F("{{serial_tx}}"), String(config.SerialTxPort));
         page.replace(F("{{status_led}}"), String(config.StatusLed));
@@ -178,18 +236,18 @@ namespace ehal::http
             page.replace(F("{{cool_enabled}}"), "");
 
         if (config.UniqueId.length() > 0)
-            page.replace(F("{{unique_id}}"), config.UniqueId);
+            page.replace(F("{{unique_id}}"), html_escape(config.UniqueId));
         else
             page.replace(F("{{unique_id}}"), device_mac());
 
-        page.replace(F("{{wifi_ssid}}"), config.WifiSsid);
-        page.replace(F("{{wifi_pw}}"), config.WifiPassword);
-        page.replace(F("{{hostname}}"), config.HostName);
-        page.replace(F("{{mqtt_server}}"), config.MqttServer);
+        page.replace(F("{{wifi_ssid}}"), html_escape(config.WifiSsid));
+        page.replace(F("{{wifi_pw}}"), html_escape(config.WifiPassword));
+        page.replace(F("{{hostname}}"), html_escape(config.HostName));
+        page.replace(F("{{mqtt_server}}"), html_escape(config.MqttServer));
         page.replace(F("{{mqtt_port}}"), String(config.MqttPort));
-        page.replace(F("{{mqtt_user}}"), config.MqttUserName);
-        page.replace(F("{{mqtt_pw}}"), config.MqttPassword);
-        page.replace(F("{{mqtt_topic}}"), config.MqttTopic);
+        page.replace(F("{{mqtt_user}}"), html_escape(config.MqttUserName));
+        page.replace(F("{{mqtt_pw}}"), html_escape(config.MqttPassword));
+        page.replace(F("{{mqtt_topic}}"), html_escape(config.MqttTopic));
         // Entity name language
         page.replace(F("{{name_lang_0}}"), config.EntityNameLanguage == 0 ? F("selected") : F(""));
         page.replace(F("{{name_lang_1}}"), config.EntityNameLanguage == 1 ? F("selected") : F(""));
@@ -200,58 +258,96 @@ namespace ehal::http
 
     void handle_configuration_js()
     {
+        if (reject_if_login_required()) // contains the WiFi SSID
+            return;
+
         String js{F(SCRIPT_CONFIGURATION_PAGE)};
 
         Config& config = config_instance();
-        js.replace(F("{{wifi_ssid}}"), config.WifiSsid);
+        js.replace(F("{{wifi_ssid}}"), js_escape(config.WifiSsid));
 
         server.send(200, F("text/javascript"), js);
     }
 
+    // "on"/"1"/"true" -> true (checkbox values sent by a script)
+    bool arg_as_bool(const String& value)
+    {
+        return value == F("on") || value == F("1") || value == F("true");
+    }
+
     void handle_save_configuration()
     {
-        Config config;
-        config.DevicePassword = server.arg(F("device_pw"));
-        config.SerialRxPort = server.arg(F("serial_rx")).toInt();
-        config.SerialTxPort = server.arg(F("serial_tx")).toInt();
-        config.StatusLed = server.arg(F("status_led")).toInt();
+        // Upstream accepted this request without a login - anybody in the network could overwrite the
+        // configuration (including the device password).
+        if (show_login_if_required())
+            return;
 
-        if (server.hasArg(F("dump_pkt")))
-            config.DumpPackets = true;
-        else
-            config.DumpPackets = false;
+        // Start from the current configuration: a field that is not part of the request keeps its
+        // value. Before, every missing field was cleared - a script that forgot e.g. wifi_ssid
+        // wiped the WiFi settings.
+        Config config = config_instance();
 
-        if (server.hasArg(F("cool_enabled")))
-            config.CoolEnabled = true;
-        else
-            config.CoolEnabled = false;
+        auto set_string = [](const __FlashStringHelper* name, String& target) {
+            if (server.hasArg(name))
+                target = server.arg(name);
+        };
 
-        if (server.hasArg(F("wifi_reset")))
-            config.WifiReset = true;
-        else
-            config.WifiReset = false;
+        // Numbers: only accepted if the field is a plain non-negative number.
+        auto set_number = [](const __FlashStringHelper* name, uint16_t& target) {
+            if (!server.hasArg(name))
+                return;
+            String value = server.arg(name);
+            value.trim();
+            if (value.isEmpty())
+                return;
+            for (size_t i = 0; i < value.length(); ++i)
+                if (!isDigit(value[i]))
+                    return;
+            long number = value.toInt();
+            if (number >= 0 && number <= 65535)
+                target = static_cast<uint16_t>(number);
+        };
 
-        config.UniqueId = server.arg(F("unique_id"));
+        // Checkboxes: a browser leaves an unchecked box out of the request. The form marks itself
+        // with the hidden field "form", then a missing box means "off". Without the marker (scripts)
+        // a missing box keeps its value and "name=on|off" sets it explicitly.
+        const bool fromForm = server.hasArg(F("form"));
+        auto set_bool = [fromForm](const __FlashStringHelper* name, bool& target) {
+            if (server.hasArg(name))
+                target = fromForm ? true : arg_as_bool(server.arg(name));
+            else if (fromForm)
+                target = false;
+        };
 
-        config.WifiSsid = server.arg(F("wifi_ssid"));
-        config.WifiPassword = server.arg(F("wifi_pw"));
+        set_string(F("device_pw"), config.DevicePassword);
+        set_number(F("serial_rx"), config.SerialRxPort);
+        set_number(F("serial_tx"), config.SerialTxPort);
+        set_number(F("status_led"), config.StatusLed);
+        set_bool(F("dump_pkt"), config.DumpPackets);
+        set_bool(F("cool_enabled"), config.CoolEnabled);
+        set_bool(F("wifi_reset"), config.WifiReset);
 
-        config.HostName = server.arg(F("hostname"));
-        config.MqttServer = server.arg(F("mqtt_server"));
-        config.MqttPort = server.arg(F("mqtt_port")).toInt();
-        config.MqttUserName = server.arg(F("mqtt_user"));
-        config.MqttPassword = server.arg(F("mqtt_pw"));
-        config.MqttTopic = server.arg(F("mqtt_topic"));
-        // If the field is missing (e.g. old scripts), the current setting is kept.
+        set_string(F("unique_id"), config.UniqueId);
+        config.UniqueId.trim();
+        if (config.UniqueId.isEmpty())
+            config.UniqueId = device_mac(); // an empty id would rename every Home Assistant entity
+
+        set_string(F("wifi_ssid"), config.WifiSsid);
+        set_string(F("wifi_pw"), config.WifiPassword);
+
+        set_string(F("hostname"), config.HostName);
+        set_string(F("mqtt_server"), config.MqttServer);
+        set_number(F("mqtt_port"), config.MqttPort);
+        set_string(F("mqtt_user"), config.MqttUserName);
+        set_string(F("mqtt_pw"), config.MqttPassword);
+        set_string(F("mqtt_topic"), config.MqttTopic);
+
         if (server.hasArg(F("name_lang")))
         {
             long lang = server.arg(F("name_lang")).toInt();
             config.EntityNameLanguage = (lang >= 0 && lang <= 2) ? static_cast<uint8_t>(lang) : 0;
         }
-        else
-        {
-            config.EntityNameLanguage = config_instance().EntityNameLanguage;
-        }
+
         save_configuration(config);
 
         String page{F(PAGE_TEMPLATE)};
@@ -271,6 +367,11 @@ namespace ehal::http
 
     void handle_clear_config()
     {
+        // POST only and login required: upstream wiped the configuration on a plain GET without a
+        // login, so any web page (e.g. an <img> tag) could reset the bridge.
+        if (show_login_if_required())
+            return;
+
         clear_configuration();
 
         String page{F(PAGE_TEMPLATE)};
@@ -284,6 +385,9 @@ namespace ehal::http
 
     void handle_query_ssid_list()
     {
+        if (reject_if_login_required())
+            return;
+
         int16_t result = WiFi.scanComplete();
 
         if (result == WIFI_SCAN_RUNNING)
@@ -333,6 +437,10 @@ namespace ehal::http
 
     void handle_query_diagnostic_logs()
     {
+        // The log shows MQTT topics, commands and (with packet dump) the serial traffic.
+        if (reject_if_login_required())
+            return;
+
         server.send(200, F("text/plain"), logs_as_json());
     }
 
@@ -359,18 +467,19 @@ namespace ehal::http
         page.replace(F("{{device_total_psram}}"), String(ESP.getPsramSize()));
         page.replace(F("{{device_cpu_temp}}"), String(get_cpu_temperature()));
 
-        page.replace(F("{{wifi_hostname}}"), WiFi.getHostname());
+        page.replace(F("{{wifi_hostname}}"), html_escape(WiFi.getHostname()));
         page.replace(F("{{wifi_ip}}"), WiFi.localIP().toString());
         page.replace(F("{{wifi_gateway_ip}}"), WiFi.gatewayIP().toString());
-        page.replace(F("{{wifi_mac}}"), WiFi.macAddress());
         page.replace(F("{{wifi_mac}}"), WiFi.macAddress());
         page.replace(F("{{wifi_rssi}}"), String(WiFi.RSSI()));
         page.replace(F("{{device_boot_time}}"), ehal::config_instance().BootTime);
         page.replace(F("{{reset_reason}}"), reset_diag_text());
         page.replace(F("{{wifi_diag}}"), wifi_diag_text());
 
-        page.replace(F("{{ha_hp_entity}}"), String(F("climate.")) + ehal::mqtt::unique_entity_name(F("climate_control")));
-        page.replace(F("{{ha_hp_z2_entity}}"), String(F("climate.")) + ehal::mqtt::unique_entity_name(F("climate_control_z2")));
+        // Home Assistant derives the entity id from the name, so only the unique id is certain.
+        page.replace(F("{{ha_hp_entity}}"), html_escape(ehal::mqtt::unique_entity_name(F("climate_control"))));
+        page.replace(F("{{ha_hp_z2_entity}}"), hp::zone2_present() == 0 ? String(F("not present"))
+                                                                         : html_escape(ehal::mqtt::unique_entity_name(F("climate_control_z2"))));
 
         page.replace(F("{{hp_tx_count}}"), uint64_to_string(hp::get_tx_msg_count()));
         page.replace(F("{{hp_rx_count}}"), uint64_to_string(hp::get_rx_msg_count()));
@@ -502,13 +611,14 @@ namespace ehal::http
         page.replace(F("{{PAGE_BODY}}"), F(BODY_TEMPLATE_HEAT_PUMP));
 
         {
-            auto& status = hp::get_status();
-            std::lock_guard<hp::Status> lock{status};
+            // Work on a copy, so the serial RX thread is not blocked while the page is built.
+            hp::StatusData status = hp::get_status_snapshot();
 
             page.replace(F("{{z1_room_temp}}"), String(status.Zone1RoomTemperature, 1));
             page.replace(F("{{z1_set_temp}}"), String(status.Zone1SetTemperature, 1));
-            page.replace(F("{{z2_room_temp}}"), String(status.Zone2RoomTemperature, 1));
-            page.replace(F("{{z2_set_temp}}"), String(status.Zone2SetTemperature, 1));
+            page.replace(F("{{z2_temps}}"), hp::zone2_present() == 0
+                ? String(F("not present"))
+                : String(status.Zone2RoomTemperature, 1) + F(" / ") + String(status.Zone2SetTemperature, 1) + F("&#176;C"));
             page.replace(F("{{dhw_temp}}"), String(status.DhwTemperature, 1));
             page.replace(F("{{dhw_set_temp}}"), String(status.DhwFlowTemperatureSetPoint, 1));
             page.replace(F("{{outside_temp}}"), String(status.OutsideTemperature, 1));
@@ -539,6 +649,10 @@ namespace ehal::http
                     ? String(hours * 60.0f / float(status.CompressorStarts), 1) : String(F("?")));
             }
 
+            {
+                String day = hp::energy_date_as_string(status.EnergyConsumedDate);
+                page.replace(F("{{energy_date}}"), day.isEmpty() ? String(F("previous day")) : day);
+            }
             page.replace(F("{{sh_consumed}}"), String(status.EnergyConsumedHeating));
             page.replace(F("{{sh_delivered}}"), String(status.EnergyDeliveredHeating));
             if (status.EnergyConsumedHeating > 0.0f)
@@ -610,6 +724,19 @@ namespace ehal::http
 
     void handle_firmware_update()
     {
+        // Upstream accepted a firmware upload without a login. The upload handler below has already
+        // refused to write anything for such a request (see UPLOAD_FILE_START).
+        if (login_required())
+        {
+            if (Update.isRunning())
+                Update.abort();
+            fwUpload = FirmwareUploadState{};
+            log_web(F("Firmware upload refused: not logged in"));
+            server.sendHeader(F("Connection"), F("close"));
+            server.send(401, F("text/plain"), F("login required"));
+            return;
+        }
+
         String page{F(PAGE_TEMPLATE)};
         server.sendHeader(F("Connection"), F("close"));
 
@@ -651,6 +778,13 @@ namespace ehal::http
         {
             fwUpload = FirmwareUploadState{};
             fwUpload.started = true;
+            // The request headers (cookie) are parsed before the body, so the login can be checked
+            // here - before anything is written to the flash.
+            if (login_required())
+            {
+                fwUpload.error = F("not logged in");
+                break;
+            }
             log_web(F("Firmware upload started: %s"), upload.filename.c_str());
             if (!Update.begin(UPDATE_SIZE_UNKNOWN))
             {
@@ -725,14 +859,18 @@ namespace ehal::http
 
             log_web(F("Successful device login, authorising client."));
 
-            server.sendHeader(F("Set-Cookie"), String(F("login-cookie=")) + loginCookie);
+            // HttpOnly: not readable by scripts. SameSite=Lax: not sent with POST requests triggered by
+            // other web sites, so they cannot save a configuration or upload a firmware on your behalf
+            // (a link to the bridge, e.g. "Visit device" in Home Assistant, still works).
+            server.sendHeader(F("Set-Cookie"), String(F("login-cookie=")) + loginCookie + F("; Path=/; HttpOnly; SameSite=Lax"));
 
             // Reset brute-force mitigation count, to avoid upsetting legitimate users.
             failedLoginCount = 0;
         }
         else
         {
-            log_web(F("Device password mismatch! Login attempted with '%s'"), server.arg(F("device_pw")).c_str());
+            // The attempted password is not logged: it is usually close to the real one.
+            log_web(F("Device password mismatch! Failed login attempt."));
 
             // Mitigate password brute-force.
             if (++failedLoginCount > 5)
@@ -1023,8 +1161,8 @@ namespace ehal::http
 
         // Forms / magic URIs for buttons.
         server.on(F("/verify_login"), handle_verify_login);
-        server.on(F("/save"), handle_save_configuration);
-        server.on(F("/clear_config"), handle_clear_config);
+        server.on(F("/save"), HTTP_POST, handle_save_configuration);
+        server.on(F("/clear_config"), HTTP_POST, handle_clear_config);
         server.on(F("/update"), HTTP_POST, handle_firmware_update, handle_firmware_update_handler);
         server.on(F("/firmware_rollback"), HTTP_POST, handle_firmware_rollback);
         server.on(F("/cn105_probe"), HTTP_GET, handle_cn105_probe);

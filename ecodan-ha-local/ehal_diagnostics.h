@@ -6,6 +6,9 @@ namespace ehal
 {
     void log_web(const __FlashStringHelper* fmt, ...);
     void log_web_ratelimit(const __FlashStringHelper* fmt, ...);
+    // Serial packet dumps go to their own ring buffer, so they do not push the
+    // regular messages out of the log (~80 packets per minute).
+    void log_packet(const __FlashStringHelper* fmt, ...);
 
     float get_cpu_temperature();
 

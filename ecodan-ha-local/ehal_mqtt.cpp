@@ -27,7 +27,6 @@ namespace ehal::mqtt
     bool connect_mqtt();
     void invalidate_published_states();
 
-    std::mutex statusUpdateMtx;
     bool needsAutoDiscover = true;
 
     // Delta publishing. For each state topic a hash of the last sent payload
@@ -54,6 +53,8 @@ namespace ehal::mqtt
     const uint32_t RC_MAX_AGE_FAST_S = 120;
     const uint32_t RC_MAX_AGE_SLOW_S = 420;
     const uint32_t RC_MAX_AGE_HOURLY_S = 3900;
+    // The RSSI changes all the time; sample it once a minute instead of publishing every change.
+    const auto RSSI_SAMPLE_INTERVAL = std::chrono::seconds(60);
     const auto DISCOVERY_SETTLE_TIME = std::chrono::seconds(5); // HA needs a moment to create the entities
     WiFiClient espClient;
     MQTTClient mqttClient(4096);
@@ -742,7 +743,6 @@ off
         payloadJson[F("curr_temp_t")] = stateTopic;
         payloadJson[F("curr_temp_tpl")] = get_current_temperature_status_template();
         payloadJson[F("temp_cmd_t")] = tempCmdTopic;
-        payloadJson[F("temp_cmd_tpl")] = F("{{ value|float }}");
         payloadJson[F("temp_cmd_tpl")] = F("{{ value }}");
 
         {
@@ -796,7 +796,6 @@ off
         payloadJson[F("curr_temp_t")] = stateTopic;
         payloadJson[F("curr_temp_tpl")] = get_current_temperature_status_template();
         payloadJson[F("temp_cmd_t")] = tempCmdTopic;
-        payloadJson[F("temp_cmd_tpl")] = F("{{ value|float }}");
         payloadJson[F("temp_cmd_tpl")] = F("{{ value }}");
 
         {
@@ -1060,9 +1059,14 @@ off
         case SensorType::POWER:
             payloadJson[F("unit_of_meas")] = F("kWh");
             payloadJson[F("icon")] = F("mdi:lightning-bolt");
-            // Daily values (0xA1/0xA2 contain a date) are reset every day -> total_increasing,
-            // otherwise HA would count the reset as negative energy.
-            payloadJson[F("stat_cla")] = F("total_increasing");
+            // GET 0xA1/0xA2 report the total of ONE finished day together with its date; the value changes
+            // once a day. "total_increasing" was wrong for that: whenever a day was higher than the day
+            // before, HA only added the difference to its statistics (measured: 37.9 instead of 73.6 kWh
+            // in nine days). With "total" and a last_reset that follows the date, HA adds each day in full.
+            // State payload is JSON: {"value": 8.41, "date": "2026-11-14T00:00:00+00:00"}
+            payloadJson[F("val_tpl")] = F("{{ value_json.value }}");
+            payloadJson[F("last_reset_value_template")] = F("{{ value_json.date }}");
+            payloadJson[F("stat_cla")] = F("total");
             payloadJson[F("dev_cla")] = F("energy");
             break;
 
@@ -1543,6 +1547,60 @@ off
         return true;
     }
 
+    // Energy of one finished day (GET 0xA1/0xA2) as JSON with the date it belongs to, see SensorType::POWER.
+    // Nothing is sent while the date is unknown: without it HA could not tell two days apart.
+    bool publish_energy_status(const String& name, float value, uint32_t date)
+    {
+        String day = hp::energy_date_as_string(date);
+        if (day.isEmpty())
+            return true;
+
+        String payload = String(F("{\"value\":")) + String(value, 2) + F(",\"date\":\"") + day + F("T00:00:00+00:00\"}");
+        const auto& config = config_instance();
+        String stateTopic = config.MqttTopic + "/" + unique_entity_name(name) + F("/state");
+        if (!publish_state(stateTopic, payload))
+        {
+            log_web(F("Failed to publish MQTT state for: %s"), unique_entity_name(name).c_str());
+            return false;
+        }
+
+        return true;
+    }
+
+    // Bridge diagnostics. Sent even while the heat pump is not connected - otherwise
+    // "Heat pump connection state" could never report "off".
+    void publish_diagnostic_state_updates()
+    {
+        if (!mqttClient.connected())
+            return;
+
+        if (!publish_binary_sensor_status(F("Heat pump connection state"), hp::is_connected()))
+            return;
+
+        static int rssi = 0;
+        static bool rssiSampled = false;
+        static std::chrono::steady_clock::time_point lastRssiSample;
+        auto now = std::chrono::steady_clock::now();
+        if (!rssiSampled || now - lastRssiSample >= RSSI_SAMPLE_INTERVAL)
+        {
+            rssiSampled = true;
+            lastRssiSample = now;
+            rssi = int(WiFi.RSSI());
+        }
+
+        if (!publish_sensor_status<int>(F("Wifi signal"), rssi))
+            return;
+
+        if (!publish_sensor_status<String>(F("Wifi SSID"), WiFi.SSID()))
+            return;
+
+        if (!publish_sensor_status<String>(F("IP address"), WiFi.localIP().toString()))
+            return;
+
+        if (!publish_sensor_status<String>(F("MAC address"), WiFi.macAddress()))
+            return;
+    }
+
     void publish_entity_state_updates()
     {
         if (!mqttClient.connected())
@@ -1554,8 +1612,10 @@ off
         if (hp::zone2_present() == 1 && !publish_z2_climate_status())
             return;
 
-        auto& status = hp::get_status();
-        std::lock_guard<hp::Status> lock{status};
+        // Work on a copy. Holding the status lock while publishing (network, up to several seconds
+        // if the broker is slow) blocked the serial RX thread: responses were handled late and
+        // counted as timeouts, in the worst case the RX thread ran into the task watchdog.
+        hp::StatusData status = hp::get_status_snapshot();
         if (!publish_binary_sensor_status(F("mode_defrost"), status.DefrostActive))
             return;
 
@@ -1678,22 +1738,22 @@ off
         if (!publish_sensor_status<String>(F("mode_heating_cooling"), status.hp_mode_as_string()))
             return;
 
-        if (!publish_sensor_status<float>(F("heating_consumed"), status.EnergyConsumedHeating))
+        if (!publish_energy_status(F("heating_consumed"), status.EnergyConsumedHeating, status.EnergyConsumedDate))
             return;
 
-        if (!publish_sensor_status<float>(F("heating_delivered"), status.EnergyDeliveredHeating))
+        if (!publish_energy_status(F("heating_delivered"), status.EnergyDeliveredHeating, status.EnergyDeliveredDate))
             return;
 
-        if (!publish_sensor_status<float>(F("cooling_consumed"), status.EnergyConsumedCooling))
+        if (!publish_energy_status(F("cooling_consumed"), status.EnergyConsumedCooling, status.EnergyConsumedDate))
             return;
 
-        if (!publish_sensor_status<float>(F("cooling_delivered"), status.EnergyDeliveredCooling))
+        if (!publish_energy_status(F("cooling_delivered"), status.EnergyDeliveredCooling, status.EnergyDeliveredDate))
             return;
 
-        if (!publish_sensor_status<float>(F("dhw_consumed"), status.EnergyConsumedDhw))
+        if (!publish_energy_status(F("dhw_consumed"), status.EnergyConsumedDhw, status.EnergyConsumedDate))
             return;
 
-        if (!publish_sensor_status<float>(F("dhw_delivered"), status.EnergyDeliveredDhw))
+        if (!publish_energy_status(F("dhw_delivered"), status.EnergyDeliveredDhw, status.EnergyDeliveredDate))
             return;
 
         if (!publish_sensor_status<float>(F("z1_room_temp"), status.Zone1RoomTemperature))
@@ -1727,22 +1787,6 @@ off
             return;
         
         if (!publish_sensor_status<float>(F("cool_cop"), status.EnergyConsumedCooling > 0.0f ? status.EnergyDeliveredCooling / status.EnergyConsumedCooling : 0.0f))
-            return;
-
-        // Diagnostic
-        if (!publish_binary_sensor_status(F("Heat pump connection state"), hp::is_connected()))
-            return;
-
-        if (!publish_sensor_status<int>(F("Wifi signal"), int(WiFi.RSSI())))
-            return;
-
-        if (!publish_sensor_status<String>(F("Wifi SSID"), WiFi.SSID()))
-            return;
-
-        if (!publish_sensor_status<String>(F("IP address"), WiFi.localIP().toString()))
-            return;
-
-        if (!publish_sensor_status<String>(F("MAC address"), WiFi.macAddress()))
             return;
     }
 
@@ -1786,54 +1830,29 @@ off
                 log_web(F("Failed to subscribe to homeassistant/status!"));
             }
 
-            String tempCmdTopic = config.MqttTopic + "/" + unique_entity_name(F("climate_control")) + F("/temp_cmd");
-            if (!mqttClient.subscribe(tempCmdTopic))
-            {
-                log_web(F("Failed to subscribe to temperature command topic!"));
-                return false;
-            }
+            // Command topics. If one subscription fails the connection is dropped, so the next
+            // reconnect attempt (30 s) retries all of them. Previously the client stayed connected
+            // with some subscriptions missing - those commands were then ignored until a reboot.
+            const String base = config.MqttTopic + "/";
+            const String commandTopics[] = {
+                base + unique_entity_name(F("climate_control")) + F("/temp_cmd"),
+                base + unique_entity_name(F("climate_control_z2")) + F("/temp_cmd"),
+                base + unique_entity_name(F("force_dhw")) + F("/set"),
+                base + unique_entity_name(F("turn_on_off_hp")) + F("/set"),
+                base + unique_entity_name(F("dhw_water_heater")) + F("/set"),
+                base + unique_entity_name(F("z1_flow_temp_target")) + F("/set"),
+                base + unique_entity_name(F("dhw_mode")) + F("/set"),
+                base + unique_entity_name(F("sh_mode")) + F("/set"),
+            };
 
-            String z2TempCmdTopic = config.MqttTopic + "/" + unique_entity_name(F("climate_control_z2")) + F("/temp_cmd");
-            if (!mqttClient.subscribe(z2TempCmdTopic))
+            for (const String& topic : commandTopics)
             {
-                log_web(F("Failed to subscribe to Z2 temperature command topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("force_dhw")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to boost DHW command topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("turn_on_off_hp")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to turn ON/OFF command topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("dhw_water_heater")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to DHW temperature topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("z1_flow_temp_target")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to Z1 flow target temperature command topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("dhw_mode")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to DHW mode command topic!"));
-                return false;
-            }
-
-            if (!mqttClient.subscribe(config.MqttTopic + "/" + unique_entity_name(F("sh_mode")) + F("/set")))
-            {
-                log_web(F("Failed to subscribe to SH mode command topic!"));
-                return false;
+                if (!mqttClient.subscribe(topic))
+                {
+                    log_web(F("Failed to subscribe to %s, dropping MQTT connection to retry"), topic.c_str());
+                    mqttClient.disconnect();
+                    return false;
+                }
             }
 
             log_web(F("Successfully established MQTT client connection!"));
@@ -1872,39 +1891,44 @@ off
 
     void handle_loop()
     {
-        if (hp::is_connected())
+        // The tick no longer depends on the heat pump connection: MQTT is reconnected and the bridge
+        // diagnostics are published even while the FTC does not answer.
+        if (periodic_update_tick())
         {
-            if (periodic_update_tick())
+            auto now = std::chrono::steady_clock::now();
+
+            // Re-establish MQTT connection if we need to (at most every 30 s, blocks up to 5 s).
+            if (!mqttClient.connected())
             {
-                auto now = std::chrono::steady_clock::now();
-
-                // Re-establish MQTT connection if we need to (at most every 30 s, blocks up to 5 s).
-                if (!mqttClient.connected())
+                static auto lastReconnect = now - MQTT_RECONNECT_INTERVAL;
+                if (now - lastReconnect >= MQTT_RECONNECT_INTERVAL)
                 {
-                    static auto lastReconnect = now - MQTT_RECONNECT_INTERVAL;
-                    if (now - lastReconnect >= MQTT_RECONNECT_INTERVAL)
-                    {
-                        lastReconnect = now;
-                        log_web(F("MQTT disconnect detected during periodic update check!"));
-                        needsAutoDiscover = true;
-                        connect_mqtt();
-                    }
+                    lastReconnect = now;
+                    log_web(F("MQTT disconnect detected during periodic update check!"));
+                    needsAutoDiscover = true;
+                    connect_mqtt();
                 }
+            }
 
-                // Publish homeassistant auto-discovery messages if we need to.
-                publish_homeassistant_auto_discover();
+            // Publish homeassistant auto-discovery messages if we need to.
+            publish_homeassistant_auto_discover();
 
-                // Periodic full refresh (in case HA missed something).
-                if (now - lastFullStateRefresh > FULL_STATE_REFRESH_INTERVAL)
-                {
-                    invalidate_published_states();
-                }
+            // Periodic full refresh (in case HA missed something).
+            if (now - lastFullStateRefresh > FULL_STATE_REFRESH_INTERVAL)
+            {
+                invalidate_published_states();
+            }
 
-                // Update entity statuses (changed values only).
-                if (now >= statePublishHoldoff)
-                {
+            // Update entity statuses (changed values only).
+            if (now >= statePublishHoldoff)
+            {
+                // Heat pump values only once a full status cycle was read since the (re)connect:
+                // before that they are zero (boot) or stale. Without updates the HA sensors expire
+                // (exp_aft) and show "unavailable", which is correct while the FTC does not answer.
+                if (hp::is_status_fresh())
                     publish_entity_state_updates();
-                }
+
+                publish_diagnostic_state_updates();
             }
         }
 

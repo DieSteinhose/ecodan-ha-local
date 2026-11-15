@@ -24,17 +24,17 @@
 namespace ehal
 {
     std::mutex diagnosticRingbufferLock;
-    psram::deque diagnosticRingbuffer;
+    psram::deque diagnosticRingbuffer; // regular messages
+    psram::deque packetRingbuffer;     // serial packet dumps ("Dump Serial Packets")
 
 #define MAX_MESSAGE_LENGTH 255U
-#define MAX_NUM_ELEMENTS 32U
+#define MAX_NUM_ELEMENTS 48U
+#define MAX_NUM_PACKETS 32U
 
-    void log_web(const __FlashStringHelper* fmt, ...)
+    // Formats "[hh:mm:ss] <message>" and appends it to a ring buffer.
+    static void log_to(psram::deque& ring, size_t maxElements, const __FlashStringHelper* fmt, va_list args)
     {
         std::unique_ptr<char[]> buffer{ new char[MAX_MESSAGE_LENGTH] };
-
-        va_list args;
-        va_start(args, fmt);
 
         // Include timestamp in diagnostic log message.
         time_t now = time(nullptr);
@@ -45,18 +45,24 @@ namespace ehal
         // Format remainder of log message into buffer.
         vsnprintf_P(buffer.get() + offset, MAX_MESSAGE_LENGTH - offset, (PGM_P)fmt, args);
 
-        va_end(args);
-
         // Block on the lock instead of busy-waiting. The busy-wait
         // (up to 10 s) could starve all lower-priority tasks including idle on the single-core ESP32-S2
         // through priority inversion (RX thread prio 5 vs. loopTask prio 1)
         // -> task watchdog. The FreeRTOS mutex passes its priority on to the holder.
         std::lock_guard<std::mutex> lock(diagnosticRingbufferLock);
 
-        if (diagnosticRingbuffer.size() > MAX_NUM_ELEMENTS)
-            diagnosticRingbuffer.pop_front();
+        while (ring.size() >= maxElements)
+            ring.pop_front();
 
-        diagnosticRingbuffer.push_back(buffer.get());
+        ring.push_back(buffer.get());
+    }
+
+    void log_web(const __FlashStringHelper* fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        log_to(diagnosticRingbuffer, MAX_NUM_ELEMENTS, fmt, args);
+        va_end(args);
     }
 
     void log_web_ratelimit(const __FlashStringHelper* fmt, ...)
@@ -67,44 +73,36 @@ namespace ehal
         if (log_time - last_log > std::chrono::seconds(1))
         {
             last_log = log_time;
-            std::unique_ptr<char[]> buffer{ new char[MAX_MESSAGE_LENGTH] };
 
             va_list args;
             va_start(args, fmt);
-
-            // Include timestamp in diagnostic log message.
-            time_t now = time(nullptr);
-            struct tm t = *localtime(&now);
-            strftime(buffer.get(), MAX_MESSAGE_LENGTH, "[%T] ", &t);
-            const size_t offset = 11; // "[14:55:02] "
-
-            // Format remainder of log message into buffer.
-            vsnprintf_P(buffer.get() + offset, MAX_MESSAGE_LENGTH - offset, (PGM_P)fmt, args);
-
+            log_to(diagnosticRingbuffer, MAX_NUM_ELEMENTS, fmt, args);
             va_end(args);
-
-            std::lock_guard<std::mutex> lock(diagnosticRingbufferLock);
-
-            if (diagnosticRingbuffer.size() > MAX_NUM_ELEMENTS)
-                diagnosticRingbuffer.pop_front();
-
-            diagnosticRingbuffer.push_back(buffer.get());
         }
+    }
+
+    void log_packet(const __FlashStringHelper* fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        log_to(packetRingbuffer, MAX_NUM_PACKETS, fmt, args);
+        va_end(args);
     }
 
     String logs_as_json()
     {
-        JsonDocument doc;        
+        JsonDocument doc;
         JsonArray msg = doc["messages"].to<JsonArray>();
+        JsonArray pkt = doc["packets"].to<JsonArray>();
 
         {
             std::lock_guard<std::mutex> lock(diagnosticRingbufferLock);
 
-            psram::deque::const_iterator end = std::end(diagnosticRingbuffer);
-            for (psram::deque::const_iterator it = std::begin(diagnosticRingbuffer); it != end; ++it)
-            {
-                msg.add(*it);
-            }
+            for (const auto& line : diagnosticRingbuffer)
+                msg.add(line);
+
+            for (const auto& line : packetRingbuffer)
+                pkt.add(line);
         }
 
         String jsonOut;
@@ -275,7 +273,7 @@ namespace ehal
                 // Only count the connected -> disconnected transition (not failed reconnects).
                 if (wifiLastConnectMs != 0)
                 {
-                    ++wifiDisconnects;
+                    wifiDisconnects = wifiDisconnects + 1;
                     wifiLastDisconnectMs = millis();
                 }
                 else if (wifiLastDisconnectMs == 0)
